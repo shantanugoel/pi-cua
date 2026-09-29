@@ -41,6 +41,8 @@ import {
 	type CuaResult,
 } from "../src/driver.ts";
 import { CaptureLedger, checkApp, checkTool } from "../src/policy.ts";
+import { CuaMcp, mcpPayload } from "../src/mcp.ts";
+import { PERCEPTION_NOTICE, findRelease, installPerception, removePerception } from "../src/perception.ts";
 
 const TOOL_NAMES = ["cua_status", "cua_observe", "cua_act", "cua_verify", "cua_describe"] as const;
 
@@ -164,6 +166,26 @@ export default function (pi: ExtensionAPI) {
 	const consentedApps = new Set<string>();
 	let sessionLabel = `${config.driver.sessionLabelPrefix}-unknown`;
 	let toolsCache: { at: number; data: Array<{ name: string; summary: string }> } | null = null;
+	/**
+	 * Capture state is per-connection, so capture-bound parse_visual_regions and
+	 * capture-bound pixel clicks need one long-lived MCP child. Started lazily, never in
+	 * the factory, and stopped from session_shutdown.
+	 */
+	let mcp: CuaMcp | null = null;
+
+	async function ensureMcp(ctx: ExtensionContext): Promise<CuaMcp> {
+		if (mcp?.alive()) return mcp;
+		const bin = binary();
+		try {
+			mcp = await CuaMcp.start(bin, { timeoutMs: Math.min(60_000, config.driver.callTimeoutMs) });
+			return mcp;
+		} catch (error) {
+			mcp = null;
+			throw new Error(
+				`could not open a persistent cua-driver mcp connection: ${String(error instanceof Error ? error.message : error)}`,
+			);
+		}
+	}
 
 	const runOpts = (ctx: ExtensionContext) => ({ timeoutMs: config.driver.callTimeoutMs, signal: ctx.signal });
 
@@ -247,9 +269,14 @@ export default function (pi: ExtensionAPI) {
 				out.perception = /not installed/i.test(text) ? "not_installed" : /status:\s*installed/i.test(text) ? "installed" : "unknown";
 				if (out.perception === "not_installed") {
 					out.perceptionNote =
-						"parse_visual_regions is unavailable, so non-AX surfaces (Chromium content, canvas apps) fall back to the accessibility tree, typed browser state, or screenshot reasoning. Install it yourself only if you accept its AGPL-3.0-only icon detector: `cua-driver extension install cua-perception --catalog <catalog.json>`.";
+						"parse_visual_regions is unavailable, so non-AX surfaces (Chromium content, canvas apps) fall back to the accessibility tree, typed browser state, or screenshot reasoning. Enable it with `/cua perception install` (fetches the signed artifact from Cua's release; includes an AGPL-3.0-only component).";
 				}
+				const release = await findRelease();
+				out.perceptionRelease = release.ok ? release.data.tag : `unavailable: ${release.message}`;
 			}
+			out.mcpConnection = mcp?.alive()
+				? { alive: true, tools: mcp.toolNames.length }
+				: { alive: false, note: "opens on first capture-bound use; required for capture-bound parse_visual_regions and pixel clicks" };
 			const body = JSON.stringify(out, null, 2);
 			return { content: tc(body), details: out };
 		},
@@ -303,12 +330,39 @@ export default function (pi: ExtensionAPI) {
 				if (!check.ok) {
 					fail({ ok: false, code: "stale_capture", message: check.reason ?? "stale capture", retryable: true });
 				}
-				args.capture_id = params.capture_id;
 				const options: Record<string, unknown> = {};
 				if (params.kinds?.length) options.kinds = params.kinds;
 				if (params.min_confidence !== undefined) options.min_confidence = params.min_confidence;
 				if (params.max_regions !== undefined) options.max_regions = params.max_regions;
-				if (Object.keys(options).length) args.options = options;
+
+				// Capture state is per-connection: this MUST go over the persistent MCP
+				// child, because a one-shot CLI process cannot resolve the capture_id.
+				const conn = await ensureMcp(ctx);
+				const mcpResult = await conn.call(
+					"parse_visual_regions",
+					Object.keys(options).length ? { capture_id: params.capture_id, options } : { capture_id: params.capture_id },
+					config.driver.callTimeoutMs,
+				);
+				const regions = mcpPayload(mcpResult);
+				if (mcpResult.isError) {
+					const code = typeof regions.code === "string" ? regions.code : "parse_failed";
+					fail({
+						ok: false,
+						code,
+						message: typeof regions.message === "string" ? regions.message : "parse_visual_regions failed",
+						retryable: regions.retryable === true,
+						hint:
+							code === "not_installed"
+								? "Ask the user to run `/cua perception install`. Do not install it yourself, and do not fall back to guessing coordinates."
+								: undefined,
+					});
+				}
+				const body = JSON.stringify({ tool, capture_id: params.capture_id, regions }, null, 1);
+				const boundedRegions = bounded("observe-regions", body);
+				return {
+					content: tc(boundedRegions.content),
+					details: { tool, captureId: params.capture_id, truncated: boundedRegions.truncated, file: boundedRegions.file },
+				};
 			}
 
 			const result = await callTool(bin, tool, args, {
@@ -320,7 +374,9 @@ export default function (pi: ExtensionAPI) {
 			const json = (result.json ?? {}) as Record<string, unknown>;
 			const captureId = typeof json.capture_id === "string" ? json.capture_id : params.capture_id;
 			const target = targetKey(params.pid, params.window_id);
-			if (captureId && params.mode !== "regions") captures.remember(captureId, target);
+			// mode=="regions" returns earlier, so anything reaching here issued a fresh
+			// capture that later actions may bind to.
+			if (captureId) captures.remember(captureId, target);
 
 			// The CLI returns a FLAT payload (no MCP structuredContent wrapper).
 			// Surface degradation explicitly: an empty AX tree and a failed capture are
@@ -427,10 +483,26 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const result = await callTool(bin, action, args, {
-				...runOpts(ctx),
-				session: config.driver.passSessionLabel ? sessionLabel : undefined,
-			});
+			let result: CuaResult;
+			if (params.capture_id && mcp?.alive()) {
+				// Capture-bound actions must stay on the connection that owns the capture.
+				const mcpResult = await mcp.call(action, args, config.driver.callTimeoutMs);
+				const payload = mcpPayload(mcpResult);
+				result = mcpResult.ok
+					? { ok: true, data: payload, json: payload, raw: JSON.stringify(payload) }
+					: {
+							ok: false,
+							code: String(payload.code ?? "driver_error"),
+							message: mcpResult.text || "driver error",
+							retryable: payload.retryable === true,
+							raw: mcpResult.text,
+						};
+			} else {
+				result = await callTool(bin, action, args, {
+					...runOpts(ctx),
+					session: config.driver.passSessionLabel ? sessionLabel : undefined,
+				});
+			}
 			if (params.capture_id) captures.consume(params.capture_id);
 			if (!result.ok) fail(result);
 
@@ -562,6 +634,44 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(granted.ok ? outputOf(granted).trim().slice(0, 800) : `grant failed: ${granted.message}`, granted.ok ? "info" : "error");
 				return;
 			}
+			if (sub === "perception") {
+				const action = rest[0] ?? "status";
+				const bin = resolveBinary(config.driver.binary);
+				if (!bin.path) return ctx.ui.notify("cua-driver binary not found", "error");
+				if (action === "status") {
+					const status = await runCuaDriver(bin.path, ["extension", "status", "cua-perception"], { timeoutMs: 30_000 });
+					const release = await findRelease();
+					ctx.ui.notify(
+						`${outputOf(status).trim().split("\n").slice(0, 4).join("\n")}\nlatest release: ${release.ok ? release.data.tag : release.message}`,
+						"info",
+					);
+					return;
+				}
+				if (action === "install") {
+					if (!ctx.hasUI) return ctx.ui.notify("refusing to install without a UI to show the licence notice", "error");
+					const approved = await ctx.ui.confirm("Install cua-perception? (includes AGPL-3.0-only code)", PERCEPTION_NOTICE);
+					if (!approved) return ctx.ui.notify("cancelled — nothing downloaded", "info");
+					ctx.ui.notify("downloading + verifying (~426 MB)…", "info");
+					const outcome = await installPerception(bin.path, (message) => ctx.ui.notify(message, "info"));
+					if (outcome.ok) {
+						// Restart the connection so the new parse path gets a fresh registry.
+						const closing = mcp;
+						mcp = null;
+						await closing?.stop().catch(() => {});
+						ctx.ui.notify('cua-perception installed — cua_observe mode:"regions" is now available', "info");
+					} else {
+						ctx.ui.notify(`install failed: ${outcome.error}${outcome.hint ? `\n${outcome.hint}` : ""}`, "error");
+					}
+					return;
+				}
+				if (action === "remove") {
+					const removed = await removePerception(bin.path);
+					ctx.ui.notify(removed.ok ? "cua-perception removed" : `remove failed: ${removed.message}`, removed.ok ? "info" : "error");
+					return;
+				}
+				ctx.ui.notify("usage: /cua perception [status|install|remove]", "info");
+				return;
+			}
 			if (sub === "config") {
 				ctx.ui.notify(`${CONFIG_PATH}\n${JSON.stringify(config, null, 2)}`, "info");
 				return;
@@ -578,6 +688,8 @@ export default function (pi: ExtensionAPI) {
 				`mode:      ${config.driver.permissionMode}`,
 				`s1:        ${config.s1.enabled ? `enabled (${config.s1.checkpoint}, ${config.s1.modality})` : "disabled (default)"}`,
 				`session:   ${sessionLabel}`,
+				`mcp:       ${mcp?.alive() ? `connected (${mcp.toolNames.length} tools)` : "not started (opens on first capture-bound use)"}`,
+				`perception: see /cua perception status`,
 				`config:    ${CONFIG_PATH}`,
 			];
 			if (bin.path) {
@@ -602,10 +714,12 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("cua", config.driver.enabled ? statusLine() : undefined);
 	});
 
-	pi.on("session_shutdown", () => {
-		// Nothing long-lived to release in phase 1: every driver call is a one-shot
-		// CLI invocation backed by the shared daemon, and the S1 sidecar (phase 2)
-		// owns its own child and kills it here.
+	pi.on("session_shutdown", async () => {
+		// The MCP child is the only long-lived resource we own. Keep this idempotent:
+		// cancellation, reload, session replacement, and exit can converge here.
+		const closing = mcp;
+		mcp = null;
+		await closing?.stop().catch(() => {});
 		consentedApps.clear();
 		toolsCache = null;
 	});

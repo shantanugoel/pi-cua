@@ -67,6 +67,9 @@ serves parameter details on demand. This keeps Pi's context window lean.
 | `cua_verify` | observe | postcondition from independent fresh state |
 | `cua_describe` | observe | the installed driver's own tool list + schemas |
 
+`cua_observe mode:"regions"` (visual regions) and any `cua_act` carrying a `capture_id`
+are routed over the persistent `cua-driver mcp` child; everything else uses the CLI.
+
 ## Configuration
 
 `~/.pi/agent/pi-cua.json`. Every value below is the default.
@@ -191,21 +194,50 @@ candidates the Cua-S1 multimodal path is evaluated against.
 - Driver itself stays MIT either way, because it talks to the worker as a separate
   process over a protocol.
 
-**What this package does:** detects it and uses it when present; **never installs it.**
-`install_extension` is in `policy.denyTools` so the agent cannot add it on your behalf.
-That keeps a published `pi-cua` free of any AGPL artifact while leaving the capability
-available to you. To enable it locally:
+**What this package does — and why it is worded this way.** `pi-cua` gives you the
+full capability without shipping a single AGPL byte:
 
 ```bash
-cua-driver extension inspect cua-perception --catalog <catalog.json>   # look first
-cua-driver extension install cua-perception --catalog <catalog.json>
-cua-driver extension status cua-perception
+/cua perception status    # what is installed, and the latest upstream release
+/cua perception install   # shows the licence notice, then fetches the signed
+                          # artifact straight from Cua's GitHub release
+/cua perception remove
 ```
 
-`cua_status` reports `perception: "installed" | "not_installed"`, and
-`cua_observe mode:"regions"` becomes usable. If your organisation does not accept AGPL,
-simply do not install it — `parse_visual_regions` returns `not_installed` and everything
-else keeps working.
+That is deliberate, and it is **not** because attribution was considered enough. It is
+not: AGPL-3.0-only's consideration is *source availability*, not credit. Giving credit
+satisfies MIT/BSD/Apache-style attribution; it does nothing for AGPL. Redistributing the
+artifact would mean shipping the AGPL licence text, notices, the model and source
+ledgers, the SBOM, and the Corresponding Source (the converted ONNX plus the pinned
+source model and the conversion/export material) — and §13 can additionally apply to a
+hosted offering.
+
+So the rule is simply: ** whoever downloads it is whoever installs it.** You fetch from
+Cua's own signed release, `pi-cua` never becomes a redistributor, and `install_extension`
+stays in `policy.denyTools` so the agent cannot add it behind your back. Three practical
+reasons to prefer this even setting licence aside:
+
+- the archive is **~426 MB per platform** (~1.27 GB across all three) — not an npm tarball
+- each release's **catalog expires one year** after its release commit, so a vendored copy
+  silently goes stale
+- Cua rotates the pinned model revisions; fetching at install time always gets the
+  current verified artifact
+
+Credit and provenance are still recorded: `cua_status` reports the resolved release tag,
+and this README names the upstream repos and licences.
+
+> If you do want to vendor or re-host it, that is a real AGPL question for your own
+> counsel — but you don't need to, so there's no reason to spend that risk.
+
+### Using regions
+
+`cua_observe` `mode:"regions"` parses one capture into text + icon regions. It requires
+the **persistent MCP connection**, not a one-shot CLI call: capture state is
+per-connection, and a second CLI process reports `capture id is unknown` for a
+`capture_id` the first one issued. pi-cua opens that child lazily on first capture-bound
+use and closes it on `session_shutdown`. Verified on driver 0.30.4: on one connection the
+same `capture_id` resolves and `parse_visual_regions` returns `not_installed` (i.e. it
+got past capture resolution to the extension check).
 
 ## Cua-S1 (phase 2)
 
