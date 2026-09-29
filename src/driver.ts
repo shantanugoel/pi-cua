@@ -259,14 +259,40 @@ export async function driverVersion(binary: string, opts?: RunOptions): Promise<
 	return { ...result, data: { version: result.raw.trim() } };
 }
 
+/**
+ * `permissions status --json` has two observed shapes on 0.30.4:
+ *   pending: { "daemon_running": true, "status": "unknown", "reason": "..." }
+ *   granted: { "accessibility": true, "screen_recording": true, "source": {...} }
+ * Normalise both into one shape instead of guessing.
+ */
 export async function permissionsStatus(
 	binary: string,
 	opts?: RunOptions,
-): Promise<CuaResult<{ status: string; daemon_running?: boolean; reason?: string }>> {
+): Promise<CuaResult<{ status: string; accessibility?: boolean; screenRecording?: boolean; daemonRunning?: boolean; reason?: string; raw: unknown }>> {
 	const result = await runCuaDriver(binary, ["permissions", "status", "--json"], opts);
 	if (!result.ok) return result;
-	const json = (result.json ?? {}) as { status?: string; daemon_running?: boolean; reason?: string };
-	return { ...result, data: { status: json.status ?? "unknown", daemon_running: json.daemon_running, reason: json.reason } };
+	const json = (result.json ?? {}) as Record<string, unknown>;
+	const accessibility = typeof json.accessibility === "boolean" ? json.accessibility : undefined;
+	const screenRecording = typeof json.screen_recording === "boolean" ? json.screen_recording : undefined;
+	const daemonRunning = typeof json.daemon_running === "boolean" ? json.daemon_running : undefined;
+	const declared = typeof json.status === "string" ? json.status : undefined;
+	const status =
+		accessibility !== undefined && screenRecording !== undefined
+			? accessibility && screenRecording
+				? "granted"
+				: "incomplete"
+			: (declared ?? "unknown");
+	return {
+		...result,
+		data: {
+			status,
+			accessibility,
+			screenRecording,
+			daemonRunning,
+			reason: typeof json.reason === "string" ? json.reason : undefined,
+			raw: json,
+		},
+	};
 }
 
 export async function daemonStatus(binary: string, opts?: RunOptions): Promise<CuaResult<{ running: boolean; raw: string }>> {

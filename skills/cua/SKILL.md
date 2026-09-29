@@ -39,6 +39,39 @@ Never invent an index or a token.
 Prefer semantics over pixels. Use `x,y` only when the accessibility tree cannot reach
 the control, and only from a fresh capture of that same target.
 
+## When the accessibility tree is empty
+
+Some surfaces expose no useful AX tree: Chromium web content, and canvas-based tools
+(Blender, Figma, DAWs, game engines). Escalate in this order:
+
+1. `cua_observe` `mode:"window"` — the accessibility tree. Always first.
+2. `cua_describe` `tool:"get_browser_state"` then use typed browser state when the
+   target is a browser page.
+3. Read the `degraded` field. `degraded: true` with
+   `degraded_reason: "ax_window_unresolved"` means the **screenshot is valid and the
+   tree is genuinely empty** — that is not a capture failure. Background input is
+   refused while a window is in this state. Re-snapshot once; if it persists, tell the
+   user and ask before using `delivery_mode:"foreground"`.
+4. `cua_observe` `mode:"regions"` with the `capture_id` from step 1 — OCR text and icon
+   regions from the same pixels. Needs `cua_status` reporting `perception: "installed"`
+   **and** a persistent driver connection (see the capture caveat below). Pick a point
+   inside one current region and pass that same `capture_id` to `cua_act`.
+5. Only if all of the above fail: report the limitation. Do not guess coordinates from
+   a screenshot you have not bound to a capture.
+
+## Capture caveat
+
+`capture_id` is resolved from a **per-process** capture registry. Over one-shot CLI
+calls the registry dies with the process, so a later call reports
+`capture id is unknown`. Capture-bound `parse_visual_regions` and capture-bound pixel
+clicks therefore need one persistent MCP connection or the typed SDK runtime, not
+successive CLI calls. Element-addressed actions (`element_token` / `element_index` with
+`pid` + `window_id`) are unaffected and are the reliable path over CLI.
+
+A capture-bound click is consumed by the driver before dispatch, and at most one action
+may derive from a capture. Capture again after any action, timeout, unknown result,
+resize, move, scroll, or navigation.
+
 ## Rules
 
 1. One exact target per action. A session label is lifecycle metadata, not capture
@@ -65,4 +98,6 @@ the control, and only from a fresh capture of that same target.
 | `consent_required` | Needs an interactive session; ask the user to approve or enable it. |
 | `user_denied` | Stop that route and report. Do not try an equivalent action. |
 | Stale element token / ambiguous window | Fresh `cua_observe`, choose the live target again. |
-| Empty accessibility tree | That is not a capture failure. Try another window, or report. |
+| Empty accessibility tree | That is not a capture failure. Escalate via "When the accessibility tree is empty". |
+| `not_installed` from `mode:"regions"` | `cua-perception` is optional and not installed. Fall back to the AX tree or typed browser state; do not install it yourself. |
+| `capture_expired` / `capture_stale` / `capture_not_found` | Re-observe; that capture is gone. Never retry it as an unbound click. |

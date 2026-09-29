@@ -325,6 +325,40 @@ without losing the driver, and vice versa.
 | 9 | `/cua-s1 install` (sparse-checkout, uv, pinned sha256) | clean machine → green smoke |
 | 10 | README, license notes, `pi-package` keyword | `pi install ./pi-cua` |
 
+## 7b. Live-driver findings (verified on macOS, driver 0.30.4, TCC granted)
+
+These changed the design and are worth keeping:
+
+1. **The CLI `call --json` payload is FLAT** — `elements`, `tree_markdown`,
+   `element_count`, `degraded`, `degraded_reason`, `background_input`, `escalation`,
+   `screenshot_png_b64`, `screenshot_width/height/scale`, `window_bounds`. There is **no
+   MCP `structuredContent` wrapper**. Code against the flat shape.
+2. **`capture_id` is per-process and disposable over CLI.** `get_desktop_state` returns
+   e.g. `capture_fd958348…_0000000000000001`, but the *next* CLI process answers
+   `capture id is unknown`. Matches the perception doc: "Each one-shot CLI process owns
+   a disposable capture registry, so a later process cannot resolve its `capture_id`."
+   **Consequence: capture-bound `parse_visual_regions` and capture-bound pixel clicks
+   cannot work over one-shot CLI.** They need one persistent `cua-driver mcp` stdio
+   child or the typed SDK. Element-addressed actions are unaffected. This is the real
+   reason to add a persistent MCP child in phase 2 — the same place the S1 sidecar
+   attaches.
+3. **`get_window_state` returned `degraded: true` / `ax_window_unresolved` with 0
+   elements for every app tested** (Finder, Ghostty, Strongbox, Preview, Activity
+   Monitor, Calendar, …) while the screenshot was valid. Documented behaviour: the tree
+   comes back empty, background input is refused, and the escape hatch is
+   `delivery_mode:"foreground"`. Must be surfaced to the model, not returned as a silent
+   empty tree.
+4. **`permissions status --json` has two shapes** — pending
+   `{daemon_running, status:"unknown", reason}` vs granted
+   `{accessibility, screen_recording, source}`. Normalise both.
+5. Useful `get_window_state` params: `include_screenshot:false` (cheap tree-only
+   re-index), `include_accessibility_tree:false` (screenshot-only preview),
+   `max_image_dimension`, `timeout_ms` (AX walk budget, default 1000). `capture_mode` is
+   deprecated and ignored.
+6. Upstream warns the tree "lies on some surfaces: Electron echo-confirms, Catalyst null
+   values, virtualized off-viewport rows with `h:1` frames" — cross-check tree and
+   screenshot rather than trusting either.
+
 ## 8. Open risks
 
 - **macOS TCC**: pi is a Node CLI; only `CuaDriver.app` (or embedded/`--direct`) is a

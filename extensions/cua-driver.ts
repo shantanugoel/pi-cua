@@ -65,6 +65,15 @@ function bounded(label: string, payload: string): { content: string; truncated: 
 	};
 }
 
+/**
+ * Mode-independent capture target key. A capture belongs to a (pid, window_id) or a
+ * display, not to whichever tool happened to take it, so observe and act must agree.
+ */
+function targetKey(pid?: number, windowId?: number, displayId?: string): string {
+	if (displayId) return `desktop:${displayId}`;
+	return `win:${pid ?? "-"}:${windowId ?? "-"}`;
+}
+
 function fail(result: CuaError): never {
 	const hint = result.hint ? `\nhint: ${result.hint}` : "";
 	throw new Error(`[${result.code}] ${result.message}${hint}`);
@@ -95,13 +104,34 @@ const ObserveParams = Type.Object({
 			Type.Literal("window"),
 			Type.Literal("desktop"),
 			Type.Literal("screen"),
+			Type.Literal("regions"),
 		],
-		{ description: "apps | windows | window (AX tree) | desktop (full display) | screen (size)." },
+		{
+			description:
+				"apps | windows | window (AX tree) | desktop (full display) | screen (size) | regions (OCR+icon regions from a capture_id; needs the optional cua-perception extension).",
+		},
 	),
 	pid: Type.Optional(Type.Number({ description: "Required for mode=windows filtering and mode=window." })),
 	window_id: Type.Optional(Type.Number({ description: "Required for mode=window." })),
+	capture_id: Type.Optional(
+		Type.String({ description: "mode=regions only: capture_id from a get_window_state / get_desktop_state observation." }),
+	),
+	kinds: Type.Optional(
+		Type.Array(Type.Union([Type.Literal("text"), Type.Literal("icon")]), {
+			description: "mode=regions only: restrict region kinds. Defaults to both.",
+		}),
+	),
+	min_confidence: Type.Optional(Type.Number({ description: "mode=regions only: drop low-confidence regions." })),
+	max_regions: Type.Optional(Type.Number({ description: "mode=regions only: bound the result set." })),
 	max_image_dimension: Type.Optional(Type.Number({ description: "Cap capture size; large captures are slow to score downstream." })),
 	include_markdown: Type.Optional(Type.Boolean({ description: "Also return the legacy tree_markdown rendering (verbose)." })),
+	include_screenshot: Type.Optional(
+		Type.Boolean({ description: "mode=window: set false for the cheap tree-only re-index before an element action. Default true." }),
+	),
+	include_accessibility_tree: Type.Optional(
+		Type.Boolean({ description: "mode=window: set false to skip the AX walk entirely and get a screenshot preview only." }),
+	),
+	timeout_ms: Type.Optional(Type.Number({ description: "mode=window: bound the AX walk (driver default 1000)." })),
 });
 
 const ActParams = Type.Object({
@@ -208,6 +238,18 @@ export default function (pi: ExtensionAPI) {
 				const doctor = await runCuaDriver(bin.path, ["doctor"], runOpts(ctx));
 				out.doctor = outputOf(doctor).trim();
 			}
+			// Perception is an optional, separately licensed extension (its OmniParser
+			// icon detector is AGPL-3.0-only). We only ever DETECT it; this package never
+			// installs it, and install_extension stays in policy.denyTools.
+			if (bin.path) {
+				const perception = await runCuaDriver(bin.path, ["extension", "status", "cua-perception"], runOpts(ctx));
+				const text = outputOf(perception);
+				out.perception = /not installed/i.test(text) ? "not_installed" : /status:\s*installed/i.test(text) ? "installed" : "unknown";
+				if (out.perception === "not_installed") {
+					out.perceptionNote =
+						"parse_visual_regions is unavailable, so non-AX surfaces (Chromium content, canvas apps) fall back to the accessibility tree, typed browser state, or screenshot reasoning. Install it yourself only if you accept its AGPL-3.0-only icon detector: `cua-driver extension install cua-perception --catalog <catalog.json>`.";
+				}
+			}
 			const body = JSON.stringify(out, null, 2);
 			return { content: tc(body), details: out };
 		},
@@ -239,11 +281,34 @@ export default function (pi: ExtensionAPI) {
 				args.window_id = params.window_id;
 				if (params.max_image_dimension) args.max_image_dimension = params.max_image_dimension;
 				if (params.include_markdown) args.include_markdown = true;
+				if (params.include_screenshot !== undefined) args.include_screenshot = params.include_screenshot;
+				if (params.include_accessibility_tree !== undefined) args.include_accessibility_tree = params.include_accessibility_tree;
+				if (params.timeout_ms !== undefined) args.timeout_ms = params.timeout_ms;
 			} else if (params.mode === "desktop") {
 				tool = "get_desktop_state";
 				if (params.max_image_dimension) args.max_image_dimension = params.max_image_dimension;
 			} else if (params.mode === "screen") {
 				tool = "get_screen_size";
+			} else if (params.mode === "regions") {
+				tool = "parse_visual_regions";
+				if (!params.capture_id) {
+					fail({
+						ok: false,
+						code: "capture_required",
+						message: "mode=regions needs the capture_id from a prior cua_observe mode=window|desktop",
+						retryable: false,
+					});
+				}
+				const check = captures.check(params.capture_id, targetKey(params.pid, params.window_id));
+				if (!check.ok) {
+					fail({ ok: false, code: "stale_capture", message: check.reason ?? "stale capture", retryable: true });
+				}
+				args.capture_id = params.capture_id;
+				const options: Record<string, unknown> = {};
+				if (params.kinds?.length) options.kinds = params.kinds;
+				if (params.min_confidence !== undefined) options.min_confidence = params.min_confidence;
+				if (params.max_regions !== undefined) options.max_regions = params.max_regions;
+				if (Object.keys(options).length) args.options = options;
 			}
 
 			const result = await callTool(bin, tool, args, {
@@ -253,14 +318,40 @@ export default function (pi: ExtensionAPI) {
 			if (!result.ok) fail(result);
 
 			const json = (result.json ?? {}) as Record<string, unknown>;
-			const captureId = typeof json.capture_id === "string" ? json.capture_id : undefined;
-			const target = `${params.mode}:${params.pid ?? "-"}:${params.window_id ?? "-"}`;
-			if (captureId) captures.remember(captureId, target);
+			const captureId = typeof json.capture_id === "string" ? json.capture_id : params.capture_id;
+			const target = targetKey(params.pid, params.window_id);
+			if (captureId && params.mode !== "regions") captures.remember(captureId, target);
 
+			// The CLI returns a FLAT payload (no MCP structuredContent wrapper).
+			// Surface degradation explicitly: an empty AX tree and a failed capture are
+			// different failures, and the model must be able to tell them apart.
+			const degraded = json.degraded === true;
 			const payload = JSON.stringify(
 				{
 					tool,
 					capture_id: captureId,
+					degraded,
+					...(degraded
+						? {
+								degraded_reason: json.degraded_reason,
+								background_input: json.background_input,
+								escalation: json.escalation,
+								note:
+									"The accessibility tree is EMPTY but the screenshot is valid. This is `ax_window_unresolved`, not a capture failure. Background input is refused until it resolves: re-snapshot, or use delivery_mode:\"foreground\" only with the user's authorization.",
+						  }
+						: {}),
+					element_count: json.element_count,
+					total_element_count: json.total_element_count,
+					truncated: json.truncated,
+					screenshot: json.screenshot_png_b64
+						? {
+								bytes_b64: String(json.screenshot_png_b64).length,
+								width: json.screenshot_width,
+								height: json.screenshot_height,
+								scale: json.screenshot_scale,
+								frame_valid: json.screenshot_frame_valid,
+						  }
+						: undefined,
 					elements: (json.structuredContent as Record<string, unknown> | undefined)?.elements ?? json.elements ?? json,
 					...(params.include_markdown && json.tree_markdown ? { tree_markdown: json.tree_markdown } : {}),
 				},
@@ -270,7 +361,7 @@ export default function (pi: ExtensionAPI) {
 			const boundedResult = bounded(`observe-${tool}`, payload);
 			return {
 				content: tc(boundedResult.content),
-				details: { tool, captureId, truncated: boundedResult.truncated, file: boundedResult.file },
+				details: { tool, captureId, degraded, truncated: boundedResult.truncated, file: boundedResult.file },
 			};
 		},
 	});
@@ -307,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Stale-capture guard.
 			if (params.capture_id) {
-				const target = `act:${params.target?.pid ?? "-"}:${params.target?.window_id ?? params.target?.display_id ?? "-"}`;
+				const target = targetKey(params.target?.pid, params.target?.window_id, params.target?.display_id);
 				const check = captures.check(params.capture_id, target);
 				if (!check.ok) {
 					fail({ ok: false, code: "stale_capture", message: check.reason ?? "stale capture", retryable: true });

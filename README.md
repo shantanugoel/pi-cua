@@ -62,7 +62,7 @@ serves parameter details on demand. This keeps Pi's context window lean.
 | Tool | Class | What |
 | --- | --- | --- |
 | `cua_status` | observe | install, daemon, TCC, capability state |
-| `cua_observe` | observe | apps / windows / one window's AX tree / display |
+| `cua_observe` | observe | apps / windows / one window's AX tree / display / visual regions |
 | `cua_act` | **mutate** | exactly one action on one exact target |
 | `cua_verify` | observe | postcondition from independent fresh state |
 | `cua_describe` | observe | the installed driver's own tool list + schemas |
@@ -161,6 +161,52 @@ So `src/policy.ts` is the real safety layer, and model confidence is not:
   is refused; our own `minProbability` / `minMargin` apply, using
   `probabilities[selected_id]` rather than the provider's `confidence`.
 
+## OmniParser / `cua-perception`
+
+`cua-perception` is an **optional, separately licensed** Driver extension that powers
+one tool, `parse_visual_regions`: it turns one screenshot into model-neutral **text
+regions** (PP-OCRv5, Apache-2.0) and **icon regions** (an OmniParser icon detector —
+a fine-tuned Ultralytics YOLO from `microsoft/OmniParser-v2.0`, **AGPL-3.0-only**).
+It runs in a CPU-only ONNX worker with no network and no Python, and it never captures
+the screen, picks an action, or sends input.
+
+**What it buys:** the only semantic route into surfaces with no accessibility tree —
+Chromium web content and canvas tools (Blender, Figma, DAWs, game engines). Without it
+those fall back to raw screenshot reasoning, which loses the capture-bound provenance
+chain that makes a pixel click auditable, and it removes the structured region
+candidates the Cua-S1 multimodal path is evaluated against.
+
+**What it costs:** the AGPL-3.0-only detector. Upstream is explicit:
+
+- *"Private use is unrestricted. Running the extension on your own machines does not
+  trigger the AGPL's source-distribution obligations."*
+- *"Redistribution carries the AGPL obligations"* — license text, notices, model and
+  source ledgers, SBOM, and corresponding source including the pinned source model and
+  the conversion/export material.
+- *"Hosted services can trigger the network-use clause"* — the shipped ONNX is a
+  converted (so modified) version of the upstream model, so §13 can apply.
+- The upstream publishes **no training data or training code**, so corresponding
+  source has a hard limit Cua cannot fill. Ultralytics sells separate commercial
+  licenses; Cua can grant nothing beyond AGPL-3.0-only.
+- Driver itself stays MIT either way, because it talks to the worker as a separate
+  process over a protocol.
+
+**What this package does:** detects it and uses it when present; **never installs it.**
+`install_extension` is in `policy.denyTools` so the agent cannot add it on your behalf.
+That keeps a published `pi-cua` free of any AGPL artifact while leaving the capability
+available to you. To enable it locally:
+
+```bash
+cua-driver extension inspect cua-perception --catalog <catalog.json>   # look first
+cua-driver extension install cua-perception --catalog <catalog.json>
+cua-driver extension status cua-perception
+```
+
+`cua_status` reports `perception: "installed" | "not_installed"`, and
+`cua_observe mode:"regions"` becomes usable. If your organisation does not accept AGPL,
+simply do not install it — `parse_visual_regions` returns `not_installed` and everything
+else keeps working.
+
 ## Cua-S1 (phase 2)
 
 `cua-s1-4b` is **not a chat model** and will never appear in `/model`. It is a LoRA
@@ -182,7 +228,8 @@ lifetime, which is why the sidecar stays resident.
 
 ## License
 
-MIT. Note that Cua Driver itself is MIT, but the optional `cua-perception` extension's
-OmniParser icon detector is **AGPL-3.0-only**. This package does not bundle, install, or
-ship it, and you should not add it to a redistributed package without reviewing the
+MIT. Cua Driver itself is also MIT. The optional `cua-perception` extension's OmniParser
+icon detector is **AGPL-3.0-only** and this package does not bundle, install, or ship it —
+see [OmniParser](#omniparser--cua-perception). Do not add it to a redistributed package
+without reviewing the
 [third-party notices](https://github.com/trycua/cua/blob/main/libs/cua-driver/docs/perception-third-party-notices.md).
