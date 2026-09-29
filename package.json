@@ -1,0 +1,24 @@
+{
+  "name": "pi-cua",
+  "version": "0.1.0",
+  "description": "Cua Driver computer-use tools for Pi, plus an optional Cua-S1 closed-candidate decision model",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "cua", "cua-driver", "computer-use", "accessibility", "macos"],
+  "pi": {
+    "extensions": ["extensions/cua-driver.ts"],
+    "skills": ["./skills"]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
+  }
+}
