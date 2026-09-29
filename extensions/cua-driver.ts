@@ -597,7 +597,7 @@ export default function (pi: ExtensionAPI) {
 	// --------------------------------------------------------------- command
 
 	pi.registerCommand("cua", {
-		description: "Cua computer-use: /cua on|off|status|doctor|grant|session|config",
+		description: "Cua computer-use: /cua on|off|status|doctor|grant|perception|session|config",
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
 
@@ -606,6 +606,18 @@ export default function (pi: ExtensionAPI) {
 				saveConfig(config);
 				setActive(true);
 				ctx.ui.notify("pi-cua driver tools enabled and saved", "info");
+				// One-time discoverability nudge: regions is the only route into non-AX
+				// surfaces, and it is off by default upstream.
+				const bin = resolveBinary(config.driver.binary);
+				if (bin.path) {
+					const status = await runCuaDriver(bin.path, ["extension", "status", "cua-perception"], { timeoutMs: 20_000 });
+					if (/not installed/i.test(outputOf(status))) {
+						ctx.ui.notify(
+							"Tip: visual regions are unavailable. Without them, Chromium content and canvas apps (Blender, Figma, DAWs) have no semantic route. Enable with `/cua perception install` — it includes an AGPL-3.0-only component; private use is unrestricted.",
+							"info",
+						);
+					}
+				}
 				return;
 			}
 			if (sub === "off" || sub === "disable") {
@@ -648,8 +660,22 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (action === "install") {
-					if (!ctx.hasUI) return ctx.ui.notify("refusing to install without a UI to show the licence notice", "error");
-					const approved = await ctx.ui.confirm("Install cua-perception? (includes AGPL-3.0-only code)", PERCEPTION_NOTICE);
+					// The licence notice must be shown and accepted. Interactive users accept
+					// via the dialog; headless runs accept explicitly, and the notice is still
+					// emitted so it lands in the transcript or log.
+					const headlessAck = rest.includes("--yes") || process.env.PI_CUA_ACCEPT_AGPL === "1";
+					let approved = false;
+					if (ctx.hasUI) {
+						approved = await ctx.ui.confirm("Install cua-perception? (includes AGPL-3.0-only code)", PERCEPTION_NOTICE);
+					} else if (headlessAck) {
+						ctx.ui.notify(PERCEPTION_NOTICE, "warning");
+						approved = true;
+					} else {
+						return ctx.ui.notify(
+							"refusing to install without confirmation. Re-run with `--yes` or set PI_CUA_ACCEPT_AGPL=1 to accept the AGPL-3.0-only notice non-interactively, or run `/cua perception install` in an interactive session.",
+							"error",
+						);
+					}
 					if (!approved) return ctx.ui.notify("cancelled — nothing downloaded", "info");
 					ctx.ui.notify("downloading + verifying (~426 MB)…", "info");
 					const outcome = await installPerception(bin.path, (message) => ctx.ui.notify(message, "info"));

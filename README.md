@@ -201,8 +201,14 @@ full capability without shipping a single AGPL byte:
 /cua perception status    # what is installed, and the latest upstream release
 /cua perception install   # shows the licence notice, then fetches the signed
                           # artifact straight from Cua's GitHub release
-/cua perception remove
+/cua perception install --yes    # headless: accept the notice non-interactively
+/cua perception remove           # (or set PI_CUA_ACCEPT_AGPL=1)
 ```
+
+The notice is always emitted before anything is downloaded. In an interactive session
+you confirm it in a dialog; headless runs must opt in explicitly with `--yes` or
+`PI_CUA_ACCEPT_AGPL=1`, and the notice is still printed so it reaches the transcript or
+log. `/cua on` reminds you once when regions are unavailable.
 
 That is deliberate, and it is **not** because attribution was considered enough. It is
 not: AGPL-3.0-only's consideration is *source availability*, not credit. Giving credit
