@@ -230,11 +230,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function statusLine(): string {
-		const bin = resolveBinary(config.driver.binary);
-		return `cua ${enabled() ? "on" : "off"} · driver ${bin.path ? "found" : "MISSING"} · s1 ${config.s1.enabled ? "on" : "off"}`;
-	}
-
 	// ---------------------------------------------------------------- tools
 
 	const LoaderParams = Type.Object({
@@ -275,7 +270,6 @@ export default function (pi: ExtensionAPI) {
 				saveConfig(config);
 			}
 			setActive(true);
-			ctx.ui.setStatus("cua", statusLine());
 			const perms = await permissionsStatus(bin.path);
 			const lines = [
 				`Cua enabled ${params.persist ? "(persisted)" : "for this session only"}.`,
@@ -752,7 +746,7 @@ export default function (pi: ExtensionAPI) {
 	// --------------------------------------------------------------- command
 
 	pi.registerCommand("cua", {
-		description: "Cua computer-use: /cua on|off|status|doctor|grant|perception|session|config",
+		description: "Cua computer-use: /cua on|session|off|status|doctor|grant|perception|config (on persists, session is this-session-only)",
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
 
@@ -761,8 +755,11 @@ export default function (pi: ExtensionAPI) {
 				sessionEnabled = false;
 				saveConfig(config);
 				setActive(true);
-				ctx.ui.setStatus("cua", statusLine());
-				ctx.ui.notify("pi-cua driver tools enabled and saved", "info");
+					ctx.ui.notify(
+					"pi-cua: enabled and SAVED to ~/.pi/agent/pi-cua.json — this persists across restarts. "
+					+"For this session only, use /cua session.",
+				"info",
+				);
 				// One-time discoverability nudge: regions is the only route into non-AX
 				// surfaces, and it is off by default upstream.
 				const bin = resolveBinary(config.driver.binary);
@@ -782,12 +779,23 @@ export default function (pi: ExtensionAPI) {
 				sessionEnabled = false;
 				saveConfig(config);
 				setActive(false);
-				ctx.ui.setStatus("cua", undefined);
-				ctx.ui.notify("pi-cua driver tools disabled and saved", "info");
+				ctx.ui.notify("pi-cua: disabled and removed from ~/.pi/agent/pi-cua.json (also clears any /cua session or cua_enable override)", "info");
 				return;
 			}
-			if (sub === "session") {
-				ctx.ui.notify(`CLI session label: ${sessionLabel}`, "info");
+			// Session-scoped enable, deliberately distinct from /cua on|enable, which
+			// persists. The label this used to print is in `/cua status`.
+			const bin0 = resolveBinary(config.driver.binary);
+			if (sub === "session" || sub === "once") {
+				if (!bin0.path) {
+					ctx.ui.notify(`cua-driver binary not found (${bin0.source}) — nothing to enable`, "error");
+					return;
+				}
+				sessionEnabled = true;
+				setActive(true);
+					ctx.ui.notify(
+					"pi-cua: enabled for THIS SESSION ONLY. Nothing was written to config; a new session starts disabled. Use /cua on to persist.",
+					"info",
+				);
 				return;
 			}
 			if (sub === "doctor") {
@@ -902,7 +910,6 @@ export default function (pi: ExtensionAPI) {
 		// includeAllExtensionTools:true, which would otherwise promote every cua_* tool
 		// into the active set regardless of config and leak them into context.
 		setActive(enabled());
-		ctx.ui.setStatus("cua", enabled() ? statusLine() : undefined);
 	});
 
 	pi.on("session_shutdown", async () => {

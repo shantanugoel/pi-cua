@@ -47,12 +47,23 @@ Four ways:
 ```bash
 pi -e ./extensions/cua-driver.ts        # one run
 PI_CUA=1 pi                             # one run
-# or in a session:  /cua on             # persists to ~/.pi/agent/pi-cua.json
+/cua session                            # THIS SESSION ONLY, writes nothing
+/cua on                                 # persists to ~/.pi/agent/pi-cua.json
 # or by hand:       {"driver":{"enabled":true}} in ~/.pi/agent/pi-cua.json
 # or just ask the model: "drive Finder"  # it calls cua_enable (this session only)
 ```
 
-`/cua off` reverses it. `/cua status` shows what is active.
+**Scope is deliberate and the two spellings differ on purpose:**
+
+| | effect | writes config? | survives new session? |
+|---|---|---|---|
+| `/cua session` (or `once`) | this session only | no | no |
+| `/cua on` (or `enable`) | persistent | yes | yes |
+| `cua_enable` tool | this session only | no, unless `persist:true` | no |
+
+`/cua off` reverses all three, including any session override. `/cua status` shows what is
+active. Nothing about Cua is rendered persistently in the footer — there is no status
+line; ask `/cua status`.
 
 ## Context cost when disabled
 
@@ -61,7 +72,7 @@ Off is the default, and off really is off. `cua_status`, `cua_observe`, `cua_act
 tool-snippet list and the rules list from the *selected* tools only
 (`dist/core/system-prompt.js`), so none of their descriptions reach the model. The `/cua`
 command is not model-visible at all. A disabled `session_start` reads one JSON file and
-clears a status line — no subprocess, no driver probe, no MCP child.
+does nothing else — no subprocess, no driver probe, no MCP child, and no persistent footer status.
 
 Two things are always resident, by design:
 

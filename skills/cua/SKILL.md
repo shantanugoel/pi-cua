@@ -13,6 +13,8 @@ first — it activates the rest for this session and touches nothing else. It do
 persist unless you pass `persist:true`, and it performs no desktop access itself.
 `cua_enable` returning `driver_missing` means Cua Driver is not installed: tell the user
 the install command rather than retrying.
+For a human, `/cua session` enables this session only and writes nothing, while
+`/cua on` persists — do not assume which one the user chose; `/cua status` reports it.
 
 
 Operate one exact target, observe its state, act once, verify the user's
