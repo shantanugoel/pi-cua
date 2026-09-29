@@ -65,6 +65,34 @@ PI_CUA=1 pi                             # one run
 active. Nothing about Cua is rendered persistently in the footer — there is no status
 line; ask `/cua status`.
 
+## Consent: no prompts by default, auto mode when you want it forced
+
+**pi-cua does not ask you to approve each action.** `policy.confirmActions` defaults to
+`false`, so a mutating action (`click`, `type_text`, `hotkey`, …) dispatches straight
+through the driver's own permission mode. If you want the old behaviour back:
+
+```bash
+/cua confirm on      # dialog before every mutating action
+/cua confirm app     # one dialog per app per session
+/cua confirm off     # never ask (the default)
+```
+
+If you would rather pin "never ask" so nothing can put a dialog in front of a run —
+CI, a background task, or you simply do not want to be interrupted — turn on **auto
+mode**:
+
+```bash
+/cua auto on                 # persists; overrides confirmActions/confirmPerApp
+/cua auto off                # back to whatever the confirm posture says
+PI_CUA_AUTO=1 pi             # one run
+# or by hand: {"policy":{"autoMode":true}} in ~/.pi/agent/pi-cua.json
+```
+
+Auto mode suppresses **action prompts only**. It does not weaken any other gate:
+`allowMutations`, `allowApps` / `denyApps`, `denyTools`, the fail-closed classifier for
+unknown tools, the stale-`capture_id` ledger, and the `cua-perception` AGPL notice all
+still apply. `/cua status` prints the effective posture on its `consent:` line.
+
 ## Context cost when disabled
 
 Off is the default, and off really is off. `cua_status`, `cua_observe`, `cua_act`,
@@ -168,8 +196,9 @@ after a snapshot, and succeed on the transport that took it.
   },
   "policy": {
     "allowMutations": true,
-    "confirmActions": true,
+    "confirmActions": false,
     "confirmPerApp": false,
+    "autoMode": false,
     "allowApps": [],
     "denyApps": [],
     "denyTools": ["kill_app", "clipboard_write", "clipboard_read",
@@ -190,8 +219,13 @@ Notes:
   driver reconfiguration are deliberately refused out of the box.
 - Anything unrecognised by the action classifier is treated as **mutating** (fail
   closed).
-- Mutating actions **fail closed when there is no UI** to consent through, so
-  unattended runs need an explicit `policy.confirmActions: false`.
+- **Consent is opt-in.** `confirmActions` defaults to false, so mutating actions run
+  without a dialog; set it true (or `/cua confirm on`) to gate each one. `autoMode`
+  (or `/cua auto on`, `PI_CUA_AUTO=1`) forces no prompts even when `confirmActions` is
+  true — that is also what unattended runs need, because when prompting is on and there
+  is no UI to consent through, mutating actions **fail closed**.
+- `confirmPerApp` only matters with `confirmActions`: one dialog per app per session
+  instead of one per action.
 - `zoom` is classified **observe**, not mutate: it crops a capture this session already
   owns and returns a JPEG, and changes no app state. Gating it behind consent would put a
   prompt on every step of the pixel ladder, which is the only ladder a canvas app
@@ -240,8 +274,9 @@ Cua's docs put the burden on the caller, not the model:
 
 So `src/policy.ts` is the real safety layer, and model confidence is not:
 
-- **Consent** — every mutating action needs an interactive confirmation; no UI means
-  no action.
+- **Consent** — opt-in: with `policy.confirmActions` (or `/cua confirm on`) every
+  mutating action needs an interactive confirmation, and no UI means no action. Off by
+  default, and `policy.autoMode` forces it off for every action.
 - **Denylist + fail-closed classification** — unknown tools count as mutating.
 - **App gating** — `allowApps` / `denyApps`.
 - **Capture ledger** — Driver captures expire after 60s and an action must carry the

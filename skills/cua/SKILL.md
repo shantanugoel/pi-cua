@@ -15,6 +15,10 @@ persist unless you pass `persist:true`, and it performs no desktop access itself
 the install command rather than retrying.
 For a human, `/cua session` enables this session only and writes nothing, while
 `/cua on` persists — do not assume which one the user chose; `/cua status` reports it.
+`/cua status` also prints the `consent:` posture: prompts are **off by default**
+(`policy.confirmActions:false`), `/cua confirm on|app` turns dialogs on, and
+`/cua auto on` pins "no prompt for any action". A quiet consent posture is not
+permission to widen the task: the user's request still bounds what you may do.
 
 
 Operate one exact target, observe its state, act once, verify the user's
@@ -163,7 +167,7 @@ not consume it.
 | `permissions_pending` | `/cua grant`, then wait for the user. Do not retry. |
 | `stale_capture` | Re-run `cua_observe`; the capture is past its lifetime. |
 | `policy_blocked` / `app_denied` | Tell the user what is blocked. Never edit `pi-cua.json` yourself. |
-| `consent_required` | Needs an interactive session; ask the user to approve or enable it. |
+| `consent_required` | The user enabled per-action prompts and this run has no UI to answer them. Tell them; they can run `/cua auto on` or `/cua confirm off`. Never edit `pi-cua.json` yourself. |
 | `user_denied` | Stop that route and report. Do not try an equivalent action. |
 | Stale element token / ambiguous window | Fresh `cua_observe`, choose the live target again. |
 | Empty accessibility tree | That is not a capture failure. Escalate via "When the accessibility tree is empty". |

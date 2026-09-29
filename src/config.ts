@@ -81,10 +81,24 @@ export interface S1Config {
 export interface PolicyConfig {
 	/** Allow mutating actions at all. Default true (still per-action consent). */
 	allowMutations: boolean;
-	/** Ask before each mutating action in interactive sessions. Default true. */
+	/**
+	 * Ask the user before each mutating action in interactive sessions.
+	 * Default FALSE: pi-cua does not interrupt you per action.
+	 * Set true (or run `/cua confirm on`) to gate every mutating action behind a dialog.
+	 * Overridden by `autoMode`.
+	 */
 	confirmActions: boolean;
-	/** When true, also require consent for the first action of a session per app. */
+	/** With confirmActions, ask once per app per session instead of once per action. */
 	confirmPerApp: boolean;
+	/**
+	 * Auto mode: never prompt the user for any GUI action, in any session, UI or not.
+	 * Default false. When true it wins over `confirmActions` / `confirmPerApp`, so an
+	 * unattended run cannot stall on a dialog nobody is there to answer.
+	 * It does NOT weaken the other gates: `allowMutations`, `allowApps` / `denyApps`,
+	 * `denyTools`, the stale-capture ledger, and the AGPL install notice still apply.
+	 * Toggle with `/cua auto on|off` or PI_CUA_AUTO=1.
+	 */
+	autoMode: boolean;
 	/** Empty allowlist means "any app not denied". */
 	allowApps: string[];
 	denyApps: string[];
@@ -125,8 +139,11 @@ export const DEFAULTS: PiCuaConfig = {
 	},
 	policy: {
 		allowMutations: true,
-		confirmActions: true,
+		// No per-action dialog by default. Opt into confirmActions (or /cua confirm on)
+		// if you want to approve each mutating action yourself.
+		confirmActions: false,
 		confirmPerApp: false,
+		autoMode: false,
 		allowApps: [],
 		denyApps: [],
 		denyTools: [...DEFAULT_DENY_TOOLS],
@@ -173,6 +190,7 @@ export function loadConfig(overrides?: Partial<PiCuaConfig>): PiCuaConfig {
 	// Environment escape hatches for one-off runs.
 	if (process.env.PI_CUA === "1") config.driver.enabled = true;
 	if (process.env.PI_CUA_S1 === "1") config.s1.enabled = true;
+	if (process.env.PI_CUA_AUTO === "1") config.policy.autoMode = true;
 	if (process.env.CUA_DRIVER_PATH) config.driver.binary = process.env.CUA_DRIVER_PATH;
 
 	if (overrides) {

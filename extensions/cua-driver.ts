@@ -11,7 +11,9 @@
  *   - Five tools instead of mirroring the driver's 58. The driver's own skill defines
  *     the loop (observe -> act once -> verify), so we expose that loop and let
  *     `cua_describe` serve parameter details on demand. This keeps Pi's context lean.
- *   - Mutating actions fail closed when there is no UI to consent through.
+ *   - Mutating actions prompt only when the user asks for it: `policy.confirmActions`
+ *     defaults to false, and `policy.autoMode` (the "never prompt me" switch) overrides
+ *     it. When prompting IS on and there is no UI to consent through, we fail closed.
  *   - The caller (us) owns capture_id discipline and preconditions. Cua's docs are
  *     explicit that a decision or a successful exit is not proof of task success.
  */
@@ -40,7 +42,7 @@ import {
 	type CuaError,
 	type CuaResult,
 } from "../src/driver.ts";
-import { CaptureLedger, checkApp, checkTool } from "../src/policy.ts";
+import { CaptureLedger, checkApp, checkTool, consentLabel } from "../src/policy.ts";
 import { CuaMcp, mcpPayload, type McpCallResult } from "../src/mcp.ts";
 import {
 	collectImages,
@@ -417,7 +419,7 @@ export default function (pi: ExtensionAPI) {
 				`tools: ${TOOL_NAMES.join(", ")}`,
 				`permissions: ${perms.ok ? JSON.stringify(perms.json).slice(0, 200) : "unknown: " + perms.message}`,
 			];
-			lines.push("Next: cua_status, then cua_observe. A GUI action still needs per-action consent where policy requires it.");
+			lines.push(`Next: cua_status, then cua_observe. Consent posture: ${consentLabel(config)}.`);
 			if (!params.persist) lines.push("Stays on until `/cua off` or a new session. Use persist:true to survive restarts and /reload.");
 			return {
 				content: tc(lines.join("\n")),
@@ -788,7 +790,7 @@ export default function (pi: ExtensionAPI) {
 							code: "consent_required",
 							message: `mutating action "${action}" needs confirmation and no UI is available`,
 							retryable: false,
-							hint: 'Set policy.confirmActions to false in ~/.pi/agent/pi-cua.json only for unattended automation you trust.',
+							hint: 'Run `/cua auto on` (or set policy.autoMode / policy.confirmActions to false in ~/.pi/agent/pi-cua.json) to stop prompting for actions.',
 						});
 					}
 					const title = `Cua: ${action} → ${appKey}`;
@@ -948,7 +950,8 @@ export default function (pi: ExtensionAPI) {
 	// --------------------------------------------------------------- command
 
 	pi.registerCommand("cua", {
-		description: "Cua computer-use: /cua on|session|off|status|doctor|grant|perception|config (on persists, session is this-session-only)",
+		description:
+			"Cua computer-use: /cua on|session|off|auto|confirm|status|doctor|grant|perception|config (on persists; session is this-session-only; auto = never prompt for any action; confirm on|app|off = prompt posture)",
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
 
@@ -982,6 +985,32 @@ export default function (pi: ExtensionAPI) {
 				saveConfig(config);
 				setActive(false);
 				ctx.ui.notify("pi-cua: disabled and removed from ~/.pi/agent/pi-cua.json (also clears any /cua session or cua_enable override)", "info");
+				return;
+			}
+			// Consent posture. `auto` is the mute switch for every action prompt and it
+			// overrides confirmActions; `confirm` is the opt-in back to dialogs. Both persist,
+			// so a later headless run inherits the posture the user chose here.
+			if (sub === "auto") {
+				const want = rest[0];
+				config.policy.autoMode = want === "on" || want === "true" || want === "1" ? true : want === "off" ? false : !config.policy.autoMode;
+				saveConfig(config);
+				ctx.ui.notify(
+					`pi-cua: auto mode ${config.policy.autoMode ? "ON - no GUI action will prompt you" : "off"}\nconsent: ${consentLabel(config)}\nsaved to ${CONFIG_PATH}`,
+					"info",
+				);
+				return;
+			}
+			if (sub === "confirm") {
+				const want = rest[0];
+				if (want === "off") {
+					config.policy.confirmActions = false;
+					config.policy.confirmPerApp = false;
+				} else {
+					config.policy.confirmActions = true;
+					config.policy.confirmPerApp = want === "app";
+				}
+				saveConfig(config);
+				ctx.ui.notify(`pi-cua: consent -> ${consentLabel(config)}\nsaved to ${CONFIG_PATH}`, "info");
 				return;
 			}
 			// Session-scoped enable, deliberately distinct from /cua on|enable, which
@@ -1081,6 +1110,7 @@ export default function (pi: ExtensionAPI) {
 				`driver:    ${enabled() ? "enabled" : "disabled (default)"} · active=${pi.getActiveTools().includes("cua_status")}`,
 				`binary:    ${bin.path ?? `not found (${bin.source})`}`,
 				`mode:      ${config.driver.permissionMode}`,
+				`consent:   ${consentLabel(config)}`,
 				`s1:        ${config.s1.enabled ? `enabled (${config.s1.checkpoint}, ${config.s1.modality})` : "disabled (default)"}`,
 				`session:   ${sessionLabel}`,
 				`mcp:       ${mcp?.alive() ? `connected (${mcp.toolNames.length} tools)` : "not started (opens on first capture-bound use)"}`,

@@ -119,7 +119,27 @@ export function checkTool(tool: string, config: PiCuaConfig): PolicyDecision {
 			actionClass,
 		};
 	}
-	return { allowed: true, requiresConsent: actionClass === "mutate" && config.policy.confirmActions, actionClass };
+	return { allowed: true, requiresConsent: actionClass === "mutate" && consentEnabled(config), actionClass };
+}
+
+/**
+ * Does this config ask the user before a mutating action?
+ *
+ * `autoMode` is the explicit "do not prompt me for any action" switch and it always
+ * wins: a run that is meant to be unattended must not stall on a dialog, and a config
+ * that says both must behave like auto. The non-prompt gates (allowMutations, app and
+ * tool lists, capture ledger) are untouched by auto mode.
+ */
+export function consentEnabled(config: PiCuaConfig): boolean {
+	return config.policy.confirmActions && !config.policy.autoMode;
+}
+
+/** Human-readable consent posture for `/cua status` and the loader's reply. */
+export function consentLabel(config: PiCuaConfig): string {
+	if (!config.policy.allowMutations) return "observe-only (allowMutations=false)";
+	if (config.policy.autoMode) return "auto (no prompts for any action)";
+	if (!config.policy.confirmActions) return "auto (no per-action prompt; confirmActions=false)";
+	return config.policy.confirmPerApp ? "confirm once per app per session" : "confirm every mutating action";
 }
 
 /** App-name gating. `app` is whatever the caller can name (bundle id or app name). */

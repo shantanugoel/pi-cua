@@ -49,7 +49,23 @@ console.assert(block?.block === true, "FAIL: disabled extension must block");
 const pol: any = await jiti.import("./src/policy.ts");
 const cfg: any = await jiti.import("./src/config.ts");
 const config = cfg.loadConfig();
-console.log("config defaults -> driver.enabled:", config.driver.enabled, "| s1.enabled:", config.s1.enabled, "| confirmActions:", config.policy.confirmActions);
+console.log("config defaults -> driver.enabled:", config.driver.enabled, "| s1.enabled:", config.s1.enabled, "| confirmActions:", config.policy.confirmActions, "| autoMode:", config.policy.autoMode);
+console.assert(config.driver.enabled === false && config.s1.enabled === false, "FAIL: must default OFF");
+// No per-action dialog out of the box, and auto mode is the explicit "never prompt" pin.
+// Asserted against DEFAULTS, not loadConfig(): a real ~/.pi/agent/pi-cua.json is the
+// user's choice and must not fail the test.
+console.assert(cfg.DEFAULTS.policy.confirmActions === false && cfg.DEFAULTS.policy.autoMode === false, "FAIL: must not prompt by default");
+const withConfirm = structuredClone(cfg.DEFAULTS);
+withConfirm.policy.confirmActions = true;
+console.log("confirmActions=true -> click requiresConsent:", pol.checkTool("click", withConfirm).requiresConsent, "| get_window_state:", pol.checkTool("get_window_state", withConfirm).requiresConsent);
+console.assert(pol.checkTool("click", withConfirm).requiresConsent === true, "FAIL: confirmActions must gate mutations");
+console.assert(pol.checkTool("get_window_state", withConfirm).requiresConsent === false, "FAIL: observe must never prompt");
+const auto = structuredClone(withConfirm);
+auto.policy.autoMode = true;
+console.log("autoMode=true (confirmActions=true) -> click requiresConsent:", pol.checkTool("click", auto).requiresConsent, "|", pol.consentLabel(auto));
+console.assert(pol.checkTool("click", auto).requiresConsent === false, "FAIL: autoMode must suppress every action prompt");
+console.assert(pol.checkTool("kill_app", auto).allowed === false, "FAIL: autoMode must not weaken denyTools");
+console.log("consent posture ->", pol.consentLabel(config), "|", pol.consentLabel(withConfirm), "|", pol.consentLabel(auto));
 console.assert(config.driver.enabled === false && config.s1.enabled === false, "FAIL: must default OFF");
 console.log("classify(click)=", pol.classify("click"), " classify(get_window_state)=", pol.classify("get_window_state"), " classify(unknown_thing)=", pol.classify("unknown_thing"));
 console.log("deny kill_app ->", JSON.stringify(pol.checkTool("kill_app", config)));
