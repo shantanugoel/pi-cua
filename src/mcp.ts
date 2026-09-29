@@ -11,6 +11,12 @@
  * then metadata-free requests. The modern `2026-07-28` revision needs per-request
  * _meta and is not required here.
  *
+ * This connection is also the ONLY session that owns our captures and screenshots.
+ * Measured on 0.30.4: `zoom` and a window-local `click x,y` both answer
+ * `screenshot_context_missing` over a fresh one-shot CLI transport even when issued
+ * immediately after a snapshot, and succeed on the transport that took it. So every
+ * call that consumes snapshot state has to arrive here, not just capture-bound ones.
+ *
  * Lifecycle: start lazily from the command or tool that needs it, never in the
  * extension factory, and stop idempotently from session_shutdown.
  */
@@ -27,6 +33,14 @@ export interface McpCallResult {
 	structured?: unknown;
 	/** Concatenated text content blocks. */
 	text: string;
+	/**
+	 * MCP `image` content blocks. These are NOT metadata: for a capture the driver puts
+	 * the screenshot HERE and keeps only `screenshot_width/height/mime_type` in
+	 * structuredContent. A client that reads text + structuredContent only will report a
+	 * screenshot it never received, and will lose the session's screenshot context for
+	 * `zoom` / `from_zoom` / window-local `x,y`.
+	 */
+	images: Array<{ data: string; mimeType: string }>;
 	raw: unknown;
 }
 
@@ -158,18 +172,24 @@ export class CuaMcp {
 				isError: true,
 				text: response.error.message ?? "mcp tool error",
 				structured: response.error,
+				images: [],
 				raw: response,
 			};
 		}
 		const result = response.result ?? {};
-		const blocks: Array<{ type?: string; text?: string }> = Array.isArray(result.content) ? result.content : [];
+		const blocks: Array<{ type?: string; text?: string; data?: string; mimeType?: string }> = Array.isArray(result.content)
+			? result.content
+			: [];
 		const text = blocks
 			.filter((b) => b.type === "text" && typeof b.text === "string")
 			.map((b) => b.text)
 			.join("\n");
+		const images = blocks
+			.filter((b) => b.type === "image" && typeof b.data === "string" && b.data.length > 0)
+			.map((b) => ({ data: b.data as string, mimeType: b.mimeType ?? "image/png" }));
 		const structured = result.structuredContent;
 		const isError = result.isError === true;
-		return { ok: !isError, isError, structured, text, raw: response };
+		return { ok: !isError, isError, structured, text, images, raw: response };
 	}
 
 	async stop(): Promise<void> {

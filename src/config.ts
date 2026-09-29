@@ -46,9 +46,12 @@ export interface DriverConfig {
 	/** Prefix for the CLI lifecycle session label passed on calls. */
 	sessionLabelPrefix: string;
 	/**
-	 * Pass the session label on driver calls. Off by default because only some tools
-	 * accept a public `session` parameter and an unknown parameter is an error; enable
-	 * it once you have confirmed your driver version accepts it for the tools you use.
+	 * Pass the session label on the read-only CLI enumeration calls (list_apps,
+	 * list_windows, get_accessibility_tree, get_screen_size). Off by default because only
+	 * some tools accept a public `session` parameter and an unknown parameter is an error.
+	 * It has no effect on captures or actions: those all share one persistent MCP
+	 * connection, whose implicit lifecycle session is what owns the capture and screenshot
+	 * context, so a label would only risk a schema rejection.
 	 */
 	passSessionLabel: boolean;
 }

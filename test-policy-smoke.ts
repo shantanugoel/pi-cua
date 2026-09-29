@@ -24,7 +24,9 @@ mod.default(pi);
 const names = tools.map((t) => t.name);
 console.log("registered tools:", names.join(", "));
 console.log("commands:", Object.keys(commands).join(", "));
-console.assert(names.length === 5, "FAIL: expected 5 tools");
+// 5 driver tools + the always-active loader. The loader must stay resident in both
+// directions: it is how a model turns the rest on.
+console.assert(names.length === 6 && names[0] === "cua_enable", "FAIL: expected cua_enable + 5 tools");
 console.assert(commands.cua, "FAIL: /cua missing");
 console.assert(!active.includes("cua_status"), "FAIL: tools must be INACTIVE by default");
 console.log("default active set (cua absent):", active.join(", "));

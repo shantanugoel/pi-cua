@@ -47,6 +47,22 @@ Never invent an index or a token.
 Prefer semantics over pixels. Use `x,y` only when the accessibility tree cannot reach
 the control, and only from a fresh capture of that same target.
 
+## What an observation actually gives you
+
+`mode:"window"` and `mode:"desktop"` return the accessibility tree AND the screenshot as
+a real image block. The pixels are not decoration: on canvas surfaces they are the only
+signal there is.
+
+- The attached image IS the capture the result names. `screenshot.width/height` equal the
+  image's own dimensions and `screenshot.sha256` hashes exactly those bytes, so a point
+  you read off the picture is a point the driver will honour.
+- `x,y` are pixels of the attached image, origin top-left. Never rescale a point yourself
+  — the driver owns the window-space mapping and applies it once.
+- `screenshot.present:false` or `attached:false` means you have no picture, and the result
+  says why. Report that; do not guess coordinates.
+- `snapshot_id` is what makes `element_index` addressable: pass `element_token`, or
+  `element_index` + `snapshot_id`. A bare `element_index` is refused.
+
 ## Finding a window id (read this first)
 
 `mode:"windows"` is the only safe way to obtain a `window_id`. `list_windows` returns
@@ -67,7 +83,8 @@ actionable elements with `degraded: false`, no focus stolen. If the id is right 
 tree is still thin, some surfaces genuinely expose little AX: Chromium web content and
 canvas-based tools (Blender, Figma, DAWs, game engines). Escalate in this order:
 
-1. `cua_observe` `mode:"window"` — the accessibility tree. Always first.
+1. `cua_observe` `mode:"window"` — the accessibility tree and the screenshot. Always
+   first.
 2. `cua_describe` `tool:"get_browser_state"` then use typed browser state when the
    target is a browser page.
 3. Read the `degraded` field. `degraded: true` with
@@ -75,7 +92,13 @@ canvas-based tools (Blender, Figma, DAWs, game engines). Escalate in this order:
    **screenshot is valid and the tree is genuinely empty** — not a capture failure.
    Background input is refused while a window is in this state. Re-snapshot once; if it
    persists, tell the user and ask before using `delivery_mode:"foreground"`.
-4. `cua_observe` `mode:"regions"` with the `capture_id` from step 1 — OCR text and icon
+4. **Use the screenshot you were given.** `cua_act` `action:"zoom"` with
+   `args:{x1,y1,x2,y2}` over the region of interest returns a <=500 px crop as another
+   image block — enough to read an 11 px label that a full-window capture blurs. Read the
+   exact point off that crop, then `cua_act` `action:"click"` with
+   `args:{from_zoom:true, x, y}`; the driver maps it back to window space. `zoom` is
+   read-only, so it costs no consent prompt, and it does not consume the capture.
+5. `cua_observe` `mode:"regions"` with the `capture_id` from step 1 — OCR text and icon
    regions from the same pixels. Needs `cua_status` reporting `perception: "installed"`.
    Pick a point inside one current region and pass that same `capture_id` to `cua_act`.
    Region shape is `{ id, kind, confidence, interactive, bounds:{x,y,width,height} }`
@@ -83,27 +106,39 @@ canvas-based tools (Blender, Figma, DAWs, game engines). Escalate in this order:
    a text region gives `undefined`. `bounds` are in the returned screenshot's space;
    `capture.action_coordinate_space` maps to action space, and the driver applies that
    mapping once, so never rescale a point yourself.
-5. Only if all of the above fail: report the limitation. Do not guess coordinates from
+6. Only if all of the above fail: report the limitation. Do not guess coordinates from
    a screenshot you have not bound to a capture.
 
 A `capture_id` only exists when a screenshot was actually taken. Passing
 `include_screenshot:false` to `mode:"window"` produces no `capture_id`, so a following
 `mode:"regions"` cannot work; re-observe with the screenshot on.
 
-## Capture caveat
+## One connection, one session
 
-`capture_id` is resolved from a registry scoped to the **MCP connection**, not the driver
+Capture state AND screenshot context are scoped to the **MCP connection**, not the driver
 daemon. A one-shot CLI process registers its capture and then closes the connection, so
-the id it prints is already dead when anything tries to use it (`capture id is unknown`).
-These tools therefore share one persistent driver connection automatically:
-`get_window_state`, `get_desktop_state`, `parse_visual_regions`, and any `cua_act`
-carrying a `capture_id`. Do not work around it with successive CLI calls.
-Element-addressed actions (`element_token` / `element_index` with `pid` + `window_id`)
-are connection-independent and remain the reliable path.
+the id it prints is already dead when anything tries to use it (`capture id is unknown`),
+and its implicit session owns no screenshot. Measured on 0.30.4: `zoom` and a
+window-local `click` with `x,y` both answer `screenshot_context_missing` over a fresh CLI
+transport even immediately after a snapshot, and succeed on the transport that took it.
+So captures, `mode:"regions"`, and **every** `cua_act` action share one persistent
+`cua-driver mcp` child automatically. Element-addressed actions are
+connection-independent and remain the reliable path.
 
-A capture-bound click is consumed by the driver before dispatch, and at most one action
-may derive from a capture. Capture again after any action, timeout, unknown result,
-resize, move, scroll, or navigation.
+Two consequences for call order:
+
+- A snapshot REPLACES the session's screenshot context. Observing with
+  `include_screenshot:false` leaves the window owning no screenshot, so a following
+  `zoom` or `x,y` action fails until you re-observe with the screenshot on. Order it:
+  observe (screenshot on) -> zoom -> click.
+- If that child is ever replaced, every `capture_id` it issued is dead. The local ledger
+  is cleared with it, so you get our `stale_capture` hint and re-observe, rather than a
+  cryptic driver error.
+
+A capture-bound pixel click is consumed by the driver before dispatch, and at most one
+action may derive from a capture. Capture again after any action, timeout, unknown
+result, resize, move, scroll, or navigation. A read-only `zoom` or `mode:"regions"` does
+not consume it.
 
 ## Rules
 
@@ -136,3 +171,5 @@ resize, move, scroll, or navigation.
 | `capture id is unknown` | The capture belonged to a closed connection. Re-observe the same target so a fresh `capture_id` is issued on the live connection. |
 | 0 elements, `ax_window_unresolved` | Almost always a stale `window_id`. Re-resolve via `mode:"windows"` and use an `on_screen: true` row. |
 | `capture_expired` / `capture_stale` / `capture_not_found` | Re-observe; that capture is gone. Never retry it as an unbound click. |
+| `screenshot_context_missing` | The window's latest snapshot owns no screenshot for this session — usually a `include_screenshot:false` observation in between, or an action issued from outside the tools. Re-observe with the screenshot on, then retry once. |
+| `NO screenshot you can see` in an observation | You are blind on this call: `include_screenshot:false`, a capture the driver could not deliver, or a model with no image input. Report it. Do not guess pixels. |

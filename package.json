@@ -14,7 +14,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node test-policy-smoke.ts && node test-driver-result.ts"
+    "test": "node test-policy-smoke.ts && node test-driver-result.ts && node test-image-delivery.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

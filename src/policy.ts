@@ -36,6 +36,10 @@ const OBSERVE_TOOLS = new Set([
 	"list_windows",
 	"parse_visual_regions",
 	"verify_state",
+	// `zoom` only crops a capture the session already owns and returns a JPEG; it changes
+	// no app state. Classifying it as a mutation put a consent prompt on every step of
+	// the pixel escalation ladder, which is the ladder's whole purpose on canvas apps.
+	"zoom",
 ]);
 
 const LIFECYCLE_TOOLS = new Set(["start_session", "end_session"]);
@@ -81,7 +85,6 @@ const MUTATE_TOOLS = new Set([
 	"start_recording",
 	"stop_recording",
 	"type_text",
-	"zoom",
 ]);
 
 export function classify(tool: string): ActionClass {
@@ -169,6 +172,15 @@ export class CaptureLedger {
 
 	consume(captureId: string): void {
 		this.captures.delete(captureId);
+	}
+
+	/**
+	 * Drop every outstanding capture. Capture state lives on the MCP connection, so when
+	 * that child is replaced the ids we issued are already dead on the driver side; a
+	 * local clear turns a confusing driver error into our own "re-observe" message.
+	 */
+	forget(): void {
+		this.captures.clear();
 	}
 
 	private prune(): void {

@@ -19,7 +19,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -41,7 +41,18 @@ import {
 	type CuaResult,
 } from "../src/driver.ts";
 import { CaptureLedger, checkApp, checkTool } from "../src/policy.ts";
-import { CuaMcp, mcpPayload } from "../src/mcp.ts";
+import { CuaMcp, mcpPayload, type McpCallResult } from "../src/mcp.ts";
+import {
+	collectImages,
+	overByteBudget,
+	overDimensionProfile,
+	DEFAULT_LIMITS,
+	finalizeImage,
+	imageMeta,
+	suggestLongEdge,
+	type DeliveredImage,
+	type InlineLimits,
+} from "../src/image.ts";
 import { PERCEPTION_NOTICE, classifyPerception, findRelease, installPerception, removePerception } from "../src/perception.ts";
 
 const TOOL_NAMES = ["cua_status", "cua_observe", "cua_act", "cua_verify", "cua_describe"] as const;
@@ -61,6 +72,62 @@ const MAX_MODEL_BYTES = 24_000;
 /** Pi requires tool content as content blocks, not a bare string. */
 function tc(value: string): TextContent[] {
 	return [{ type: "text", text: value }];
+}
+
+/**
+ * Text plus REAL image blocks. A screenshot that only exists as a `bytes_b64` count in a
+ * JSON string is not perception: the model sees metadata and nothing else, which is how a
+ * canvas app becomes undrivable. This is the model-facing delivery point.
+ */
+function resultContent(text: string, images: DeliveredImage[]): (TextContent | ImageContent)[] {
+	const blocks: (TextContent | ImageContent)[] = [{ type: "text", text }];
+	for (const image of images) blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
+	return blocks;
+}
+
+/** One-line provenance for an attached screenshot, so the model can bind to it. */
+function imageLead(image: DeliveredImage, label: string): string {
+	return (
+		`${label} attached as an image block: ${image.width}x${image.height} ${image.mimeType}, sha256 ${image.sha256
+			.slice(0, 16)}… . Read x,y straight off this image — that is the space the driver expects.\n`
+	);
+}
+
+/** Inline-image ceiling for the current model, falling back to Pi's own defaults. */
+function limitsFor(ctx: ExtensionContext): InlineLimits {
+	const resize = ctx.model?.inputLimits?.images?.resize as Partial<InlineLimits> | undefined;
+	return {
+		maxBytes: resize?.maxBytes ?? DEFAULT_LIMITS.maxBytes,
+		maxWidth: resize?.maxWidth ?? DEFAULT_LIMITS.maxWidth,
+		maxHeight: resize?.maxHeight ?? DEFAULT_LIMITS.maxHeight,
+	};
+}
+
+/**
+ * A capture only reaches the model if the current model accepts image input — the same
+ * check Pi's own `read` tool makes. Attaching one to a text-only model risks a rejected
+ * request, and the model would still be blind to it. The capture itself stays valid, so
+ * capture-bound actions remain legal; what is lost is the model's own eyes, and it has
+ * to be told that in as many words.
+ */
+function forModel(ctx: ExtensionContext, image: DeliveredImage | null): { images: DeliveredImage[]; omitted?: string } {
+	if (!image) return { images: [] };
+	const input = (ctx.model as { input?: string[] } | undefined)?.input;
+	if (ctx.model && Array.isArray(input) && !input.includes("image")) {
+		return { images: [], omitted: `the current model (${ctx.model.id}) does not accept image input` };
+	}
+	return { images: [image] };
+}
+
+/** Normalise an MCP tool error into our error shape (a CuaError, ready for fail()). */
+function mcpFailure(call: McpCallResult): { ok: false; code: string; message: string; retryable: boolean } {
+	const payload = mcpPayload(call);
+	return {
+		ok: false,
+		code: String(payload.code ?? "driver_error"),
+		message: call.text || (typeof payload.message === "string" ? payload.message : "driver error"),
+		retryable: payload.retryable === true,
+	};
 }
 
 /** Keep large AX trees out of model context; hand the model a file instead. */
@@ -99,8 +166,13 @@ const Target = Type.Object(
 			Type.String({ description: "Fresh element token returned by the latest snapshot. PREFERRED over element_index." }),
 		),
 		element_index: Type.Optional(Type.Number({ description: "Index from the latest snapshot. Replaced by the next snapshot." })),
-		x: Type.Optional(Type.Number({ description: "Window-local screenshot pixel x, only with a fresh capture of the same target." })),
+		x: Type.Optional(Type.Number({ description: "Window-local screenshot pixel x, read off the attached screenshot of a fresh capture of the same target." })),
 		y: Type.Optional(Type.Number({ description: "Window-local screenshot pixel y." })),
+		snapshot_id: Type.Optional(
+			Type.String({
+				description: "snapshot_id from the latest observation. Required by element actions when addressing by element_index rather than element_token.",
+			}),
+		),
 		display_id: Type.Optional(Type.String({ description: 'Desktop target display, e.g. "primary".' })),
 	},
 	{ description: "Exact target. A session is lifecycle metadata, not capture scope or permission authority." },
@@ -138,10 +210,16 @@ const ObserveParams = Type.Object({
 	max_image_dimension: Type.Optional(Type.Number({ description: "Cap capture size; large captures are slow to score downstream." })),
 	include_markdown: Type.Optional(Type.Boolean({ description: "Also return the legacy tree_markdown rendering (verbose)." })),
 	include_screenshot: Type.Optional(
-		Type.Boolean({ description: "mode=window: set false for the cheap tree-only re-index before an element action. Default true." }),
+		Type.Boolean({
+			description:
+				"mode=window: set false for the cheap tree-only re-index before an element action. Default true. Caution: a snapshot without a screenshot REPLACES the session's screenshot context, so zoom and x,y actions fail with screenshot_context_missing until you re-observe with it on.",
+		}),
 	),
 	include_accessibility_tree: Type.Optional(
-		Type.Boolean({ description: "mode=window: set false to skip the AX walk entirely and get a screenshot preview only." }),
+		Type.Boolean({
+			description:
+				"mode=window: set false to skip the AX walk entirely and get the screenshot only — the right call on canvas surfaces (Blender, Figma, DAWs, games) where the tree is empty anyway and the walk is the expensive part.",
+		}),
 	),
 	timeout_ms: Type.Optional(Type.Number({ description: "mode=window: bound the AX walk (driver default 1000)." })),
 });
@@ -183,14 +261,18 @@ export default function (pi: ExtensionAPI) {
 		return config.driver.enabled || sessionEnabled;
 	}
 	/**
-	 * Capture state is per-connection, so capture-bound parse_visual_regions and
-	 * capture-bound pixel clicks need one long-lived MCP child. Started lazily, never in
-	 * the factory, and stopped from session_shutdown.
+	 * Capture state AND screenshot context are per-connection, so every call that produces
+	 * or consumes a capture, a snapshot, or a zoom must share one long-lived MCP child.
+	 * Started lazily, never in the factory, and stopped from session_shutdown.
 	 */
 	let mcp: CuaMcp | null = null;
 
-	async function ensureMcp(ctx: ExtensionContext): Promise<CuaMcp> {
+	async function ensureMcp(_ctx: ExtensionContext): Promise<CuaMcp> {
 		if (mcp?.alive()) return mcp;
+		// A replaced connection is a new driver session, so every capture_id issued on the old
+		// one is already dead there. Drop them locally and let our own stale_capture hint
+		// explain it instead of forwarding a cryptic driver error.
+		captures.forget();
 		const bin = binary();
 		try {
 			mcp = await CuaMcp.start(bin, { timeoutMs: Math.min(60_000, config.driver.callTimeoutMs) });
@@ -201,6 +283,65 @@ export default function (pi: ExtensionAPI) {
 				`could not open a persistent cua-driver mcp connection: ${String(error instanceof Error ? error.message : error)}`,
 			);
 		}
+	}
+
+	/**
+	 * One capture, delivered at a size the model can actually receive.
+	 *
+	 * The pixels handed to the model must BE the image the reported geometry describes:
+	 * the driver translates window-local screenshot pixels using ITS snapshot (measured:
+	 * x=99999 px -> 121937.6 pt at the driver's own scale), so rescaling bytes after the
+	 * fact would mis-aim every click while reporting a healthy result. An oversized frame
+	 * is therefore re-requested from the driver at a smaller long edge, which keeps
+	 * `screenshot_width/height` and the delivered pixels the same image. If it still
+	 * cannot fit we omit the image and say why — a missing screenshot is a reportable
+	 * failure, a silently rescaled one is not.
+	 */
+	async function grab(
+		conn: CuaMcp,
+		tool: string,
+		args: Record<string, unknown>,
+		limits: InlineLimits,
+	): Promise<
+		| { ok: true; payload: Record<string, unknown>; image: DeliveredImage | null; note?: string }
+		| { ok: false; code: string; message: string; retryable: boolean }
+	> {
+		const call = await conn.call(tool, args, config.driver.callTimeoutMs);
+		if (!call.ok) return mcpFailure(call);
+		let split = collectImages(mcpPayload(call), call.images);
+		let image = split.images.length ? finalizeImage(split.images[0]) : null;
+		let note = image ? undefined : "the driver returned no image for this capture";
+
+		let attempts = 0;
+		while (image) {
+			// Only the byte ceiling is worth a re-capture: it can get the whole request
+			// rejected. Oversized dimensions are a token-cost note, not a failure.
+			const problem = overByteBudget(image, limits);
+			if (!problem) break;
+			const longEdge = Math.max(
+				Number(split.payload.screenshot_width ?? 0),
+				Number(split.payload.screenshot_height ?? 0),
+				image.width ?? 0,
+				image.height ?? 0,
+			);
+			const next = attempts < 2 ? suggestLongEdge(longEdge, image, limits) : 0;
+			if (!next) {
+				note = `${problem}; re-observe with max_image_dimension:${Math.max(512, Math.floor(longEdge / 2))}`;
+				image = null;
+				break;
+			}
+			attempts++;
+			const retry = await conn.call(tool, { ...args, max_image_dimension: next }, config.driver.callTimeoutMs);
+			if (!retry.ok) {
+				note = `${problem}; the smaller re-capture at max_image_dimension:${next} failed (${retry.text.slice(0, 160)})`;
+				image = null;
+				break;
+			}
+			split = collectImages(mcpPayload(retry), retry.images);
+			image = split.images.length ? finalizeImage(split.images[0]) : null;
+			note = image ? `re-captured at max_image_dimension:${next} to fit the inline-image budget` : "the driver returned no image for this capture";
+		}
+		return { ok: true, payload: split.payload, image, note };
 	}
 
 	const runOpts = (ctx: ExtensionContext) => ({ timeoutMs: config.driver.callTimeoutMs, signal: ctx.signal });
@@ -348,7 +489,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			out.mcpConnection = mcp?.alive()
 				? { alive: true, tools: mcp.toolNames.length }
-				: { alive: false, note: "opens on first capture-bound use; required for capture-bound parse_visual_regions and pixel clicks" };
+				: {
+						alive: false,
+						note:
+							"opens on first capture or action; captures, visual regions and EVERY cua_act action share it, because capture and screenshot context are per-connection, not per-daemon",
+				  };
 			const body = JSON.stringify(out, null, 2);
 			return { content: tc(body), details: out };
 		},
@@ -488,82 +633,106 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Capture state belongs to the MCP *connection*, not the driver daemon. A one-shot
-			// CLI process registers its capture and then closes the connection, so the
-			// capture_id it prints is already dead when a later call tries to use it. Every
-			// capture-PRODUCING call therefore shares the persistent child's connection, which
-			// is the only way the capture-consuming side (parse_visual_regions, capture-bound
-			// actions) can ever resolve it.
+			// Capture state AND screenshot context belong to the MCP *connection*, not the driver
+			// daemon. A one-shot CLI process registers its capture and then closes the
+			// connection, so the capture_id it prints is already dead and its implicit session
+			// owns no screenshot. Every capture-PRODUCING call therefore shares the persistent
+			// child's connection, which is the only way the capture-consuming side
+			// (parse_visual_regions, zoom, window-local x,y) can ever resolve it.
 			const producesCapture = tool === "get_window_state" || tool === "get_desktop_state";
-			let result: CuaResult;
-			if (producesCapture) {
-			const conn = await ensureMcp(ctx);
-			const mcpResult = await conn.call(tool, args, config.driver.callTimeoutMs);
-			const payload = mcpPayload(mcpResult);
-			result = mcpResult.ok
-			? { ok: true, data: payload, json: payload, raw: JSON.stringify(payload) }
-			: {
-			ok: false,
-			code: String(payload.code ?? "driver_error"),
-			message: mcpResult.text || "driver error",
-			retryable: payload.retryable === true,
-			raw: mcpResult.text,
-			};
-			} else {
-			result = await callTool(bin, tool, args, {
-			...runOpts(ctx),
-			session: config.driver.passSessionLabel ? sessionLabel : undefined,
-			});
+			if (!producesCapture) {
+				const listed = await callTool(bin, tool, args, {
+					...runOpts(ctx),
+					session: config.driver.passSessionLabel ? sessionLabel : undefined,
+				});
+				if (!listed.ok) fail(listed);
+				const body = JSON.stringify({ tool, result: listed.json ?? listed.raw }, null, 1);
+				const boundedList = bounded(`observe-${tool}`, body);
+				return {
+					content: tc(boundedList.content),
+					details: { tool, truncated: boundedList.truncated, file: boundedList.file },
+				};
 			}
-			if (!result.ok) fail(result);
 
-			const json = (result.json ?? {}) as Record<string, unknown>;
-			const captureId = typeof json.capture_id === "string" ? json.capture_id : params.capture_id;
+			const conn = await ensureMcp(ctx);
+			const grabbed = await grab(conn, tool, args, limitsFor(ctx));
+			if (!grabbed.ok) fail({ ok: false, code: grabbed.code, message: grabbed.message, retryable: grabbed.retryable });
+
+			const json = grabbed.payload;
+			const image = grabbed.image;
+			const captureId = typeof json.capture_id === "string" ? json.capture_id : undefined;
 			const target = targetKey(params.pid, params.window_id);
-			// mode=="regions" returns earlier, so anything reaching here issued a fresh
-			// capture that later actions may bind to.
+			// mode=="regions" returns earlier, so anything reaching here issued a fresh capture
+			// that later actions may bind to.
 			if (captureId) captures.remember(captureId, target);
 
-			// The CLI returns a FLAT payload (no MCP structuredContent wrapper).
 			// Surface degradation explicitly: an empty AX tree and a failed capture are
 			// different failures, and the model must be able to tell them apart.
 			const degraded = json.degraded === true;
-			const payload = JSON.stringify(
-				{
-					tool,
-					capture_id: captureId,
-					degraded,
-					...(degraded
-						? {
-								degraded_reason: json.degraded_reason,
-								background_input: json.background_input,
-								escalation: json.escalation,
-								note:
-									"The accessibility tree is EMPTY but the screenshot is valid. This is `ax_window_unresolved`, not a capture failure. Background input is refused until it resolves: re-snapshot, or use delivery_mode:\"foreground\" only with the user's authorization.",
-						  }
-						: {}),
-					element_count: json.element_count,
-					total_element_count: json.total_element_count,
-					truncated: json.truncated,
-					screenshot: json.screenshot_png_b64
-						? {
-								bytes_b64: String(json.screenshot_png_b64).length,
-								width: json.screenshot_width,
-								height: json.screenshot_height,
-								scale: json.screenshot_scale,
-								frame_valid: json.screenshot_frame_valid,
-						  }
-						: undefined,
-					elements: (json.structuredContent as Record<string, unknown> | undefined)?.elements ?? json.elements ?? json,
-					...(params.include_markdown && json.tree_markdown ? { tree_markdown: json.tree_markdown } : {}),
-				},
-				null,
-				1,
-			);
-			const boundedResult = bounded(`observe-${tool}`, payload);
+			const deliverable = forModel(ctx, image);
+			const dimNote = image ? overDimensionProfile(image, limitsFor(ctx)) : null;
+			// A missing picture must never be ambiguous with an empty tree: say exactly why.
+			const missingImageReason =
+				params.include_screenshot === false
+					? "include_screenshot:false was requested, so no capture exists and there is no capture_id to bind to"
+					: (grabbed.note ?? "the driver returned no image for this capture");
+			const shaped: Record<string, unknown> = {
+				tool,
+				capture_id: captureId,
+				snapshot_id: json.snapshot_id,
+				degraded,
+				...(degraded
+					? {
+							degraded_reason: json.degraded_reason,
+							background_input: json.background_input,
+							escalation: json.escalation,
+							note:
+								"The accessibility tree is EMPTY but the screenshot is valid. This is `ax_window_unresolved`, not a capture failure. Background input is refused until it resolves: re-snapshot, or use delivery_mode:\"foreground\" only with the user's authorization.",
+					  }
+					: {}),
+				element_count: json.element_count,
+				total_element_count: json.total_element_count,
+				truncated: json.truncated,
+				window_bounds: json.window_bounds,
+				screenshot_scale: json.screenshot_scale,
+				screenshot: image
+					? {
+							...imageMeta(image),
+							attached: deliverable.images.length > 0,
+							...(deliverable.omitted ? { attach_note: deliverable.omitted } : {}),
+							frame_valid: json.screenshot_frame_valid,
+							...(grabbed.note ? { note: grabbed.note } : {}),
+							...(dimNote ? { size_note: dimNote } : {}),
+					  }
+					: { present: false, reason: missingImageReason },
+			};
+			if (Array.isArray(json.elements)) shaped.elements = json.elements;
+			if (params.include_markdown && json.tree_markdown) shaped.tree_markdown = json.tree_markdown;
+			// Keep the rest of what the driver reported (desktop geometry, original size,
+			// counts) rather than dropping it. The base64 is already gone: collectImages
+			// removed it from `json` and delivered it as an image block instead.
+			for (const [key, value] of Object.entries(json)) {
+				if (!(key in shaped) && key !== "elements" && key !== "tree_markdown" && key !== "structuredContent" && key !== "_note") {
+					shaped[key] = value;
+				}
+			}
+
+			const boundedResult = bounded(`observe-${tool}`, JSON.stringify(shaped, null, 1));
+			const forModelOmittedNote = deliverable.omitted ?? "not attached";
+			const lead = deliverable.images.length
+				? imageLead(image as DeliveredImage, "Screenshot")
+				: `NO screenshot you can see (${image ? forModelOmittedNote : missingImageReason}). Do not guess coordinates from a screen you cannot see.\n`;
 			return {
-				content: tc(boundedResult.content),
-				details: { tool, captureId, degraded, truncated: boundedResult.truncated, file: boundedResult.file },
+				content: resultContent(lead + boundedResult.content, deliverable.images),
+				details: {
+					tool,
+					captureId,
+					snapshotId: json.snapshot_id,
+					degraded,
+					truncated: boundedResult.truncated,
+					file: boundedResult.file,
+					screenshot: image ? imageMeta(image) : { present: false, reason: missingImageReason },
+				},
 			};
 		},
 	});
@@ -582,7 +751,8 @@ export default function (pi: ExtensionAPI) {
 		executionMode: "sequential",
 		parameters: ActParams,
 		async execute(_id, params: Static<typeof ActParams>, _signal, _u, ctx) {
-			const bin = binary();
+			// Fail fast with the install hint, before any consent prompt.
+			binary();
 			const action = params.action.trim();
 			const policy = checkTool(action, config);
 			if (!policy.allowed) fail({ ok: false, code: "policy_blocked", message: policy.reason ?? "blocked", retryable: false });
@@ -629,44 +799,63 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			let result: CuaResult;
-			if (params.capture_id) {
-				// If the child is not up yet we must start it: the capture can only live on a
-				// connection that still exists, and the CLI path can never resolve this id.
-				const conn = mcp?.alive() ? mcp : await ensureMcp(ctx);
-				const mcpResult = await conn.call(action, args, config.driver.callTimeoutMs);
-				// Capture-bound actions must stay on the connection that owns the capture.
-				const payload = mcpPayload(mcpResult);
-				result = mcpResult.ok
-					? { ok: true, data: payload, json: payload, raw: JSON.stringify(payload) }
-					: {
-							ok: false,
-							code: String(payload.code ?? "driver_error"),
-							message: mcpResult.text || "driver error",
-							retryable: payload.retryable === true,
-							raw: mcpResult.text,
-						};
-			} else {
-				result = await callTool(bin, action, args, {
-					...runOpts(ctx),
-					session: config.driver.passSessionLabel ? sessionLabel : undefined,
-				});
-			}
-			if (params.capture_id) captures.consume(params.capture_id);
-			if (!result.ok) fail(result);
+			// EVERY action goes over the one persistent connection, not just capture-bound
+			// ones. The driver scopes screenshot context to the session that owns the latest
+			// snapshot, and a one-shot CLI process gets a fresh implicit session per call.
+			// Measured on 0.30.4: `zoom` and a window-local `click` with x,y both answer
+			// `screenshot_context_missing` over a fresh CLI transport even when issued
+			// immediately after a snapshot, and succeed on the transport that took it. Element
+			// tokens resolve connection-independently, so this only ever adds capability.
+			const conn = await ensureMcp(ctx);
+			const call = await conn.call(action, args, config.driver.callTimeoutMs);
+			// The driver admits and consumes a capture atomically only when it dispatches
+			// pixels. A read-only zoom or a region parse must leave the capture usable, so
+			// don't burn it here for actions that cannot have consumed it.
+			const dispatchesPixels = args.x !== undefined || args.y !== undefined || args.from_x !== undefined || args.from_zoom === true;
+			if (params.capture_id && dispatchesPixels) captures.consume(params.capture_id);
+			if (!call.ok) fail(mcpFailure(call));
 
-			const json = (result.json ?? {}) as Record<string, unknown>;
+			const collected = collectImages(mcpPayload(call), call.images);
+			const json = collected.payload;
+			const image = collected.images.length ? finalizeImage(collected.images[0]) : null;
+			const deliverable = forModel(ctx, image);
 			const effect = typeof json.effect === "string" ? json.effect : undefined;
-			const summary = { action, effect, result: json };
+			const summary = {
+				action,
+				effect,
+				...(image
+					? {
+							screenshot: {
+								...imageMeta(image),
+								attached: deliverable.images.length > 0,
+								...(deliverable.omitted ? { attach_note: deliverable.omitted } : {}),
+							},
+						}
+					: {}),
+				result: json,
+			};
 			const warning =
 				effect === "unverifiable"
 					? "\n\nWARNING: effect is \"unverifiable\". This is NOT proof the action worked. Verify with cua_verify."
 					: "\n\nVerify the postcondition with cua_verify or a fresh cua_observe before continuing.";
-			const body = JSON.stringify(summary, null, 1);
-			const boundedResult = bounded(`act-${action}`, body);
+			const zoomHint =
+				action === "zoom" && deliverable.images.length
+					? "Pass from_zoom:true with x,y read off this crop to click it; the driver maps the point back to window space.\n"
+					: "";
+			const lead = deliverable.images.length
+				? imageLead(image as DeliveredImage, `${action} image`) + zoomHint
+				: image
+					? `${action} captured an image that was NOT attached (${deliverable.omitted}). You cannot see it.\n`
+					: "";
+			const boundedResult = bounded(`act-${action}`, JSON.stringify(summary, null, 1));
 			return {
-				content: tc(boundedResult.content + warning),
-				details: { action, effect, truncated: boundedResult.truncated },
+				content: resultContent(lead + boundedResult.content + warning, deliverable.images),
+				details: {
+					action,
+					effect,
+					truncated: boundedResult.truncated,
+					screenshot: image ? imageMeta(image) : undefined,
+				},
 			};
 		},
 	});
@@ -686,16 +875,29 @@ export default function (pi: ExtensionAPI) {
 				: { ok: false, code: "no_expectation", message: "no expect object supplied", retryable: false };
 
 			if (!result.ok && params.snapshot_fallback !== false) {
-				const fresh = await callTool(
-					bin,
-					"get_window_state",
-					{ pid: params.pid, window_id: params.window_id },
-					runOpts(ctx),
-				);
-				if (fresh.ok) {
-					const body = JSON.stringify({ verified: false, reason: result.message, fresh_state: fresh.json }, null, 1);
+				// Same connection and same delivery rules as cua_observe. Going through the CLI
+				// here used to stringify the whole flat payload, whose inline
+				// `screenshot_png_b64` is ~2.5 MB for one window — the model got 24 KB of
+				// truncated base64 as text and no picture.
+				const conn = await ensureMcp(ctx);
+				const grabbed = await grab(conn, "get_window_state", { pid: params.pid, window_id: params.window_id }, limitsFor(ctx));
+				if (grabbed.ok) {
+					const fresh = grabbed.payload;
+					const captureId = typeof fresh.capture_id === "string" ? fresh.capture_id : undefined;
+					if (captureId) captures.remember(captureId, targetKey(params.pid, params.window_id));
+					const freshState = {
+						capture_id: captureId,
+						snapshot_id: fresh.snapshot_id,
+						element_count: fresh.element_count,
+						screenshot: grabbed.image ? imageMeta(grabbed.image) : { present: false, reason: grabbed.note },
+						elements: Array.isArray(fresh.elements) ? fresh.elements : undefined,
+					};
+					const body = JSON.stringify({ verified: false, reason: result.message, fresh_state: freshState }, null, 1);
 					const boundedResult = bounded("verify-fresh", body);
-					return { content: tc(boundedResult.content), details: { verified: false } };
+					return {
+						content: resultContent(boundedResult.content, forModel(ctx, grabbed.image).images),
+						details: { verified: false, screenshot: grabbed.image ? imageMeta(grabbed.image) : undefined },
+					};
 				}
 				fail(result);
 			}
@@ -918,6 +1120,7 @@ export default function (pi: ExtensionAPI) {
 		const closing = mcp;
 		mcp = null;
 		await closing?.stop().catch(() => {});
+		captures.forget();
 		consentedApps.clear();
 		toolsCache = null;
 	});

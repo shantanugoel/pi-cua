@@ -100,13 +100,43 @@ serves parameter details on demand. This keeps Pi's context window lean.
 | Tool | Class | What |
 | --- | --- | --- |
 | `cua_status` | observe | install, daemon, TCC, capability state |
-| `cua_observe` | observe | apps / windows / one window's AX tree / display / visual regions |
+| `cua_observe` | observe | apps / windows / one window's AX tree + screenshot / display / visual regions |
 | `cua_act` | **mutate** | exactly one action on one exact target |
 | `cua_verify` | observe | postcondition from independent fresh state |
 | `cua_describe` | observe | the installed driver's own tool list + schemas |
 
-`cua_observe mode:"regions"` (visual regions) and any `cua_act` carrying a `capture_id`
-are routed over the persistent `cua-driver mcp` child; everything else uses the CLI.
+### Screenshots reach the model, as pixels
+
+`cua_observe mode:"window"` and `mode:"desktop"` attach the capture as an `image` content
+block, not as a byte count in a JSON string. Over MCP the driver puts the screenshot in an
+`image` content block and leaves only `screenshot_width/height/mime_type` in
+`structuredContent`, so a client that reads the structured payload alone will happily
+report a screenshot it never delivered — which is indistinguishable from working, until
+the model is asked to click a pixel in Blender. The result also reports the delivered
+image's own `sha256` and dimensions, read back out of the bytes, so a capture-bound action
+is provably grounded in what the model saw.
+
+Two rules follow from that, and both are deliberate:
+
+- **Never rescale a delivered capture.** Pixel actions are expressed in the pixels of the
+  image the model was handed (the driver translates window-local screenshot pixels using
+  its own snapshot geometry), so a silent resample would mis-aim every click while looking
+  healthy. If a capture is too big for the model's inline byte budget, the driver is
+  re-asked for a smaller one, and the result says so in `screenshot.note`. A capture that
+  merely exceeds the model's resize *profile* is delivered as-is with a `size_note`,
+  because shrinking is exactly what makes small UI labels unreadable — to the model and to
+  OCR alike.
+- **A missing picture is stated, never implied.** `screenshot.present:false` or
+  `attached:false` plus the reason (no capture requested, driver returned none, or the
+  current model takes no image input) is the honest answer, and the skill tells the model
+  to report it instead of guessing coordinates.
+
+Captures, `mode:"regions"`, and **every** `cua_act` action are routed over the persistent
+`cua-driver mcp` child; read-only enumeration (`list_apps`, `list_windows`,
+`get_accessibility_tree`, `get_screen_size`) and driver introspection use the CLI. Screenshot
+context is per-connection: measured on 0.30.4, `zoom` and a window-local `click` both
+return `screenshot_context_missing` over a fresh one-shot CLI transport even immediately
+after a snapshot, and succeed on the transport that took it.
 
 ## Configuration
 
@@ -162,6 +192,10 @@ Notes:
   closed).
 - Mutating actions **fail closed when there is no UI** to consent through, so
   unattended runs need an explicit `policy.confirmActions: false`.
+- `zoom` is classified **observe**, not mutate: it crops a capture this session already
+  owns and returns a JPEG, and changes no app state. Gating it behind consent would put a
+  prompt on every step of the pixel ladder, which is the only ladder a canvas app
+  (Blender, Figma, a DAW) has.
 
 ## Why CLI-first, with one persistent MCP child
 
@@ -174,13 +208,21 @@ are daemon-backed. Most calls stay on the CLI because it:
 - gives this extension the caller-side policy seam that Cua's own docs require the
   caller to own.
 
-One class of call cannot live on the CLI: anything bound to a `capture_id`. Capture state
-is scoped to the MCP **connection**, and a one-shot CLI process closes its connection the
-moment it prints, so the id it issued is already dead. pi-cua therefore starts a single
-persistent `cua-driver mcp` child lazily and routes `get_window_state`,
-`get_desktop_state`, `parse_visual_regions` and capture-bound `cua_act` calls through it,
-so the capture that produces an id and the call that consumes it share one connection.
-The child is closed on `session_shutdown`.
+One class of call cannot live on the CLI: anything that produces or consumes a capture,
+a snapshot, or a zoom. That state is scoped to the MCP **connection**, and a one-shot CLI
+process closes its connection the moment it prints, so the id it issued is already dead
+and its implicit session owns no screenshot. Measured on 0.30.4, `zoom` and a
+window-local `click` with `x,y` both answer `screenshot_context_missing` over a fresh CLI
+transport even when issued immediately after a snapshot, and succeed on the transport
+that took it — so a CLI action path silently removes every pixel-level capability.
+
+pi-cua therefore starts a single persistent `cua-driver mcp` child lazily and routes
+`get_window_state`, `get_desktop_state`, `parse_visual_regions` and **every** `cua_act`
+action through it, so the capture that produces an id, the screenshot the model was
+handed, and the action that consumes them share one connection. Read-only enumeration
+(`list_apps`, `list_windows`, `get_accessibility_tree`, `get_screen_size`) and driver
+introspection stay on the CLI. The child is closed on `session_shutdown`, and replacing it
+clears the local capture ledger so a dead id fails with our own "re-observe" hint.
 
 If you would rather put everything on MCP, install [`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter)
 and add `{"cua-driver": {"command": "cua-driver", "args": ["mcp"]}}` to
