@@ -42,7 +42,7 @@ import {
 } from "../src/driver.ts";
 import { CaptureLedger, checkApp, checkTool } from "../src/policy.ts";
 import { CuaMcp, mcpPayload } from "../src/mcp.ts";
-import { PERCEPTION_NOTICE, findRelease, installPerception, removePerception } from "../src/perception.ts";
+import { PERCEPTION_NOTICE, classifyPerception, findRelease, installPerception, removePerception } from "../src/perception.ts";
 
 const TOOL_NAMES = ["cua_status", "cua_observe", "cua_act", "cua_verify", "cua_describe"] as const;
 
@@ -266,7 +266,10 @@ export default function (pi: ExtensionAPI) {
 			if (bin.path) {
 				const perception = await runCuaDriver(bin.path, ["extension", "status", "cua-perception"], runOpts(ctx));
 				const text = outputOf(perception);
-				out.perception = /not installed/i.test(text) ? "not_installed" : /status:\s*installed/i.test(text) ? "installed" : "unknown";
+				const perc = classifyPerception(text);
+				out.perception = perc.state;
+				if (perc.version) out.perceptionVersion = perc.version;
+				if (perc.detail) out.perceptionDetail = perc.detail;
 				if (out.perception === "not_installed") {
 					out.perceptionNote =
 						"parse_visual_regions is unavailable, so non-AX surfaces (Chromium content, canvas apps) fall back to the accessibility tree, typed browser state, or screenshot reasoning. Enable it with `/cua perception install` (fetches the signed artifact from Cua's release; includes an AGPL-3.0-only component).";
@@ -299,8 +302,59 @@ export default function (pi: ExtensionAPI) {
 			let tool = "list_apps";
 			const args: Record<string, unknown> = {};
 			if (params.mode === "windows") {
-				tool = "list_windows";
-				if (params.pid) args.pid = params.pid;
+				// `list_windows` returns every layer-0 window WindowServer knows about, including
+				// off-Space and stale ones, and its FIRST entry is often not the visible window.
+				// Feeding such an id to get_window_state yields ax_window_unresolved with 0
+				// elements, which is indistinguishable from a broken Accessibility grant. So mark
+				// each entry with whether get_accessibility_tree sees it on screen, and sort those
+				// first. Measured here: list_windows[0] matched the visible window for 1 of 3 pids.
+				const tree = await callTool(bin, "get_accessibility_tree", {}, runOpts(ctx));
+				const onScreen = new Map<string, Record<string, unknown>>();
+				if (tree.ok && tree.json && typeof tree.json === "object") {
+				const wins = (tree.json as Record<string, unknown>).windows;
+				if (Array.isArray(wins)) {
+				for (const w of wins) {
+				const rec = w as Record<string, unknown>;
+				const id = Number(rec.window_id);
+				if (Number.isFinite(id)) onScreen.set(`${Number(rec.owner_pid ?? rec.pid)}:${id}`, rec);
+				}
+				}
+				}
+				const listed = await callTool(bin, "list_windows", params.pid ? { pid: params.pid } : {}, runOpts(ctx));
+				const rows: Array<Record<string, unknown>> = [];
+				const seen = new Set<string>();
+				const listedJson = listed.ok && listed.json && typeof listed.json === "object" ? (listed.json as Record<string, unknown>).windows : undefined;
+				if (Array.isArray(listedJson)) {
+				for (const w of listedJson) {
+				const rec = w as Record<string, unknown>;
+				const pid = Number(rec.owner_pid ?? rec.pid ?? params.pid ?? 0);
+				const id = Number(rec.window_id);
+				if (!Number.isFinite(id)) continue;
+				const key = `${pid}:${id}`;
+				seen.add(key);
+				rows.push({ pid, window_id: id, title: rec.title ?? rec.name ?? "", layer: rec.layer, on_screen: onScreen.has(key) });
+				}
+				}
+				for (const [key, rec] of onScreen) {
+				if (seen.has(key)) continue;
+				const [pidStr, idStr] = key.split(":");
+				const pid = Number(pidStr);
+				if (params.pid && pid !== params.pid) continue;
+				rows.push({ pid, window_id: Number(idStr), title: rec.title ?? rec.name ?? "", on_screen: true });
+				}
+				rows.sort((a, b) => Number(b.on_screen) - Number(a.on_screen));
+				const usable = rows.filter((r) => r.on_screen).length;
+				return {
+				content: [
+				{
+				type: "text",
+				text:
+				`On-screen-confirmed windows: ${usable} of ${rows.length}. Use only on_screen=true ids for get_window_state; the rest are off-Space or stale and will report ax_window_unresolved.\n` +
+				JSON.stringify(rows.slice(0, 60), null, 1),
+				},
+				],
+				details: { mode: "windows", on_screen: usable, total: rows.length, rows },
+				};
 			} else if (params.mode === "window") {
 				tool = "get_window_state";
 				if (!params.pid || !params.window_id) fail({ ok: false, code: "bad_request", message: "mode=window needs pid and window_id", retryable: false });
@@ -365,10 +419,33 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const result = await callTool(bin, tool, args, {
-				...runOpts(ctx),
-				session: config.driver.passSessionLabel ? sessionLabel : undefined,
+			// Capture state belongs to the MCP *connection*, not the driver daemon. A one-shot
+			// CLI process registers its capture and then closes the connection, so the
+			// capture_id it prints is already dead when a later call tries to use it. Every
+			// capture-PRODUCING call therefore shares the persistent child's connection, which
+			// is the only way the capture-consuming side (parse_visual_regions, capture-bound
+			// actions) can ever resolve it.
+			const producesCapture = tool === "get_window_state" || tool === "get_desktop_state";
+			let result: CuaResult;
+			if (producesCapture) {
+			const conn = await ensureMcp(ctx);
+			const mcpResult = await conn.call(tool, args, config.driver.callTimeoutMs);
+			const payload = mcpPayload(mcpResult);
+			result = mcpResult.ok
+			? { ok: true, data: payload, json: payload, raw: JSON.stringify(payload) }
+			: {
+			ok: false,
+			code: String(payload.code ?? "driver_error"),
+			message: mcpResult.text || "driver error",
+			retryable: payload.retryable === true,
+			raw: mcpResult.text,
+			};
+			} else {
+			result = await callTool(bin, tool, args, {
+			...runOpts(ctx),
+			session: config.driver.passSessionLabel ? sessionLabel : undefined,
 			});
+			}
 			if (!result.ok) fail(result);
 
 			const json = (result.json ?? {}) as Record<string, unknown>;
@@ -484,9 +561,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			let result: CuaResult;
-			if (params.capture_id && mcp?.alive()) {
+			if (params.capture_id) {
+				// If the child is not up yet we must start it: the capture can only live on a
+				// connection that still exists, and the CLI path can never resolve this id.
+				const conn = mcp?.alive() ? mcp : await ensureMcp(ctx);
+				const mcpResult = await conn.call(action, args, config.driver.callTimeoutMs);
 				// Capture-bound actions must stay on the connection that owns the capture.
-				const mcpResult = await mcp.call(action, args, config.driver.callTimeoutMs);
 				const payload = mcpPayload(mcpResult);
 				result = mcpResult.ok
 					? { ok: true, data: payload, json: payload, raw: JSON.stringify(payload) }
@@ -611,7 +691,7 @@ export default function (pi: ExtensionAPI) {
 				const bin = resolveBinary(config.driver.binary);
 				if (bin.path) {
 					const status = await runCuaDriver(bin.path, ["extension", "status", "cua-perception"], { timeoutMs: 20_000 });
-					if (/not installed/i.test(outputOf(status))) {
+					if (classifyPerception(outputOf(status)).state !== "installed") {
 						ctx.ui.notify(
 							"Tip: visual regions are unavailable. Without them, Chromium content and canvas apps (Blender, Figma, DAWs) have no semantic route. Enable with `/cua perception install` — it includes an AGPL-3.0-only component; private use is unrestricted.",
 							"info",

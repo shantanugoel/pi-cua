@@ -125,18 +125,26 @@ Notes:
 - Mutating actions **fail closed when there is no UI** to consent through, so
   unattended runs need an explicit `policy.confirmActions: false`.
 
-## Why the CLI and not MCP
+## Why CLI-first, with one persistent MCP child
 
 Pi has no built-in MCP support, and the driver's own skill names the CLI as the default
 agent surface ("Use the CLI by default when a shell is available"); one-shot CLI calls
-are daemon-backed. Staying on the CLI also:
+are daemon-backed. Most calls stay on the CLI because it:
 
 - keeps TCC attribution on the supported `CuaDriver.app` identity — spawning a raw
   `cua-driver serve` outside that bundle is documented as unsupported;
 - gives this extension the caller-side policy seam that Cua's own docs require the
   caller to own.
 
-If you would rather use MCP, install [`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter)
+One class of call cannot live on the CLI: anything bound to a `capture_id`. Capture state
+is scoped to the MCP **connection**, and a one-shot CLI process closes its connection the
+moment it prints, so the id it issued is already dead. pi-cua therefore starts a single
+persistent `cua-driver mcp` child lazily and routes `get_window_state`,
+`get_desktop_state`, `parse_visual_regions` and capture-bound `cua_act` calls through it,
+so the capture that produces an id and the call that consumes it share one connection.
+The child is closed on `session_shutdown`.
+
+If you would rather put everything on MCP, install [`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter)
 and add `{"cua-driver": {"command": "cua-driver", "args": ["mcp"]}}` to
 `~/.pi/agent/mcp.json`. You lose the policy seam and the Cua-S1 hook, and note that
 `this package's` consent gate will not cover those tools.
@@ -237,13 +245,25 @@ and this README names the upstream repos and licences.
 
 ### Using regions
 
-`cua_observe` `mode:"regions"` parses one capture into text + icon regions. It requires
-the **persistent MCP connection**, not a one-shot CLI call: capture state is
-per-connection, and a second CLI process reports `capture id is unknown` for a
-`capture_id` the first one issued. pi-cua opens that child lazily on first capture-bound
-use and closes it on `session_shutdown`. Verified on driver 0.30.4: on one connection the
-same `capture_id` resolves and `parse_visual_regions` returns `not_installed` (i.e. it
-got past capture resolution to the extension check).
+`cua_observe` `mode:"regions"` parses one capture into text + icon regions through the
+persistent child described above.
+
+Verified end to end on driver 0.30.4 with `cua-perception` 0.2.1 installed:
+`mode:"windows"` -> on-screen window -> `mode:"window"` (`degraded: false`, `captureId`
+issued) -> `mode:"regions"` returned 8 regions from `omniparser-v2-ppocrv5-en` in ~4.7 s
+with the same `capture_id` echoed back. Across 7 on-screen windows the parser produced
+40 regions each, 10-21 of them OCR text.
+
+Two shape details that cost real debugging time:
+
+- a `kind:"text"` region carries its OCR string in **`text`**; `kind:"icon"` carries
+  **`label`**. Reading `.label` on a text region returns `undefined`.
+- `capture_id` exists only if a screenshot was taken. `include_screenshot:false` means
+  there is nothing to parse.
+
+Region bounds are in the returned screenshot's space and
+`capture.action_coordinate_space` maps them to action space; the driver applies that
+mapping once, so never rescale a point yourself.
 
 ## Cua-S1 (phase 2)
 

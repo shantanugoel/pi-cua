@@ -39,34 +39,59 @@ Never invent an index or a token.
 Prefer semantics over pixels. Use `x,y` only when the accessibility tree cannot reach
 the control, and only from a fresh capture of that same target.
 
+## Finding a window id (read this first)
+
+`mode:"windows"` is the only safe way to obtain a `window_id`. `list_windows` returns
+every layer-0 window WindowServer has ever tracked for a pid — off-Space, minimized and
+stale entries included — and **its first entry is usually not the visible one**. On a
+measured machine it returned 248 windows of which 11 were on screen. Passing a stale id
+to `get_window_state` yields `ax_window_unresolved` with 0 elements, which looks exactly
+like a broken Accessibility grant but is not.
+
+Use only rows with `on_screen: true`. If you took a `window_id` from a raw `list_windows`
+call, re-resolve it through `mode:"windows"` before believing any empty-tree result.
+
 ## When the accessibility tree is empty
 
-Some surfaces expose no useful AX tree: Chromium web content, and canvas-based tools
-(Blender, Figma, DAWs, game engines). Escalate in this order:
+First rule out the wrong window id above. A *correct* on-screen id resolves even for
+background windows — measured: 5/6 background on-screen windows returned 9-1176
+actionable elements with `degraded: false`, no focus stolen. If the id is right and the
+tree is still thin, some surfaces genuinely expose little AX: Chromium web content and
+canvas-based tools (Blender, Figma, DAWs, game engines). Escalate in this order:
 
 1. `cua_observe` `mode:"window"` — the accessibility tree. Always first.
 2. `cua_describe` `tool:"get_browser_state"` then use typed browser state when the
    target is a browser page.
 3. Read the `degraded` field. `degraded: true` with
-   `degraded_reason: "ax_window_unresolved"` means the **screenshot is valid and the
-   tree is genuinely empty** — that is not a capture failure. Background input is
-   refused while a window is in this state. Re-snapshot once; if it persists, tell the
-   user and ask before using `delivery_mode:"foreground"`.
+   `degraded_reason: "ax_window_unresolved"` on an `on_screen: true` id means the
+   **screenshot is valid and the tree is genuinely empty** — not a capture failure.
+   Background input is refused while a window is in this state. Re-snapshot once; if it
+   persists, tell the user and ask before using `delivery_mode:"foreground"`.
 4. `cua_observe` `mode:"regions"` with the `capture_id` from step 1 — OCR text and icon
-   regions from the same pixels. Needs `cua_status` reporting `perception: "installed"`
-   **and** a persistent driver connection (see the capture caveat below). Pick a point
-   inside one current region and pass that same `capture_id` to `cua_act`.
+   regions from the same pixels. Needs `cua_status` reporting `perception: "installed"`.
+   Pick a point inside one current region and pass that same `capture_id` to `cua_act`.
+   Region shape is `{ id, kind, confidence, interactive, bounds:{x,y,width,height} }`
+   plus **`text` for `kind:"text"` and `label` for `kind:"icon"`** — reading `.label` on
+   a text region gives `undefined`. `bounds` are in the returned screenshot's space;
+   `capture.action_coordinate_space` maps to action space, and the driver applies that
+   mapping once, so never rescale a point yourself.
 5. Only if all of the above fail: report the limitation. Do not guess coordinates from
    a screenshot you have not bound to a capture.
 
+A `capture_id` only exists when a screenshot was actually taken. Passing
+`include_screenshot:false` to `mode:"window"` produces no `capture_id`, so a following
+`mode:"regions"` cannot work; re-observe with the screenshot on.
+
 ## Capture caveat
 
-`capture_id` is resolved from a **per-process** capture registry. Over one-shot CLI
-calls the registry dies with the process, so a later call reports
-`capture id is unknown`. Capture-bound `parse_visual_regions` and capture-bound pixel
-clicks therefore need one persistent MCP connection or the typed SDK runtime, not
-successive CLI calls. Element-addressed actions (`element_token` / `element_index` with
-`pid` + `window_id`) are unaffected and are the reliable path over CLI.
+`capture_id` is resolved from a registry scoped to the **MCP connection**, not the driver
+daemon. A one-shot CLI process registers its capture and then closes the connection, so
+the id it prints is already dead when anything tries to use it (`capture id is unknown`).
+These tools therefore share one persistent driver connection automatically:
+`get_window_state`, `get_desktop_state`, `parse_visual_regions`, and any `cua_act`
+carrying a `capture_id`. Do not work around it with successive CLI calls.
+Element-addressed actions (`element_token` / `element_index` with `pid` + `window_id`)
+are connection-independent and remain the reliable path.
 
 A capture-bound click is consumed by the driver before dispatch, and at most one action
 may derive from a capture. Capture again after any action, timeout, unknown result,
@@ -99,5 +124,7 @@ resize, move, scroll, or navigation.
 | `user_denied` | Stop that route and report. Do not try an equivalent action. |
 | Stale element token / ambiguous window | Fresh `cua_observe`, choose the live target again. |
 | Empty accessibility tree | That is not a capture failure. Escalate via "When the accessibility tree is empty". |
-| `not_installed` from `mode:"regions"` | `cua-perception` is optional and not installed. Fall back to the AX tree or typed browser state; do not install it yourself. |
+| `not_installed` from `mode:"regions"` | `cua-perception` is optional and not installed. Ask the user to run `/cua perception install`; do not install it yourself, and fall back to the AX tree or typed browser state. |
+| `capture id is unknown` | The capture belonged to a closed connection. Re-observe the same target so a fresh `capture_id` is issued on the live connection. |
+| 0 elements, `ax_window_unresolved` | Almost always a stale `window_id`. Re-resolve via `mode:"windows"` and use an `on_screen: true` row. |
 | `capture_expired` / `capture_stale` / `capture_not_found` | Re-observe; that capture is gone. Never retry it as an unbound click. |

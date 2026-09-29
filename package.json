@@ -12,6 +12,10 @@
   "engines": {
     "node": ">=20"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node test-policy-smoke.ts && node test-driver-result.ts"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",

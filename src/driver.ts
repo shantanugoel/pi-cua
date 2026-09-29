@@ -90,32 +90,51 @@ export function resolveBinary(configured: string | null): { path: string | null;
  *   pending; no action started, retry after the permission gate completes
  * So we must never assume stdout parses.
  */
-function classifyText(text: string): CuaError {
+/**
+ * Classify a non-JSON failure. Driver error tokens are lowercase snake_case
+ * (`permissions_pending`, `error`, `invalid_png`). Human headings such as
+ * `name: get_window_state`, `bring_to_front: Persistently activate...` and
+ * `Extension: cua-perception 0.2.1` are NOT error codes, so this match is
+ * deliberately case-sensitive and snake_case-only.
+ */
+function classifyText(text: string, code: number): CuaError {
 	const trimmed = text.trim();
 	const first = trimmed.split("\n")[0] ?? trimmed;
 	const colon = first.indexOf(":");
-	const maybeCode = colon > 0 && colon < 40 ? first.slice(0, colon).trim() : "";
-	const looksLikeCode = /^[a-z][a-z0-9_]*$/i.test(maybeCode);
+	const maybeCode = colon > 0 && colon < 40 ? first.slice(0, colon) : "";
+	const looksLikeCode = /^[a-z][a-z0-9_]*$/.test(maybeCode);
 
 	if (looksLikeCode) {
-		const code = maybeCode;
-		const message = first.slice(colon + 1).trim();
 		const hint =
-			code === "permissions_pending"
+			maybeCode === "permissions_pending"
 				? "Grant permissions to CuaDriver.app: `cua-driver permissions grant` (Accessibility + Screen Recording), then retry."
 				: undefined;
 		return {
 			ok: false,
-			code,
-			message: message || first,
-			retryable: code === "permissions_pending" || code === "timeout",
+			code: maybeCode,
+			message: first.slice(colon + 1).trim() || first,
+			retryable: maybeCode === "permissions_pending",
 			hint,
 			raw: trimmed,
 		};
 	}
-	return { ok: false, code: "driver_text_output", message: first || "empty output", retryable: false, raw: trimmed };
+	return {
+		ok: false,
+		code: "driver_exit",
+		message: first || `cua-driver exited with code ${code}`,
+		retryable: false,
+		raw: trimmed,
+	};
 }
 
+/**
+ * Exit status is the authority. Verified on driver 0.30.4: every success (`doctor`,
+ * `status`, `describe`, `list-tools`, `extension inspect|status`) exits 0 with plain
+ * text, and every genuine failure exits nonzero. `call --json` failures are FLAT JSON
+ * carrying a `code` (e.g. {"code":"window_id_not_found","suggestion":...}), not the
+ * {"ok":false,"error":{...}} envelope — that envelope belongs to `perception parse`
+ * local mode. Assuming otherwise makes plain-text successes look like errors.
+ */
 function toResult<T>(code: number, stdout: string, stderr: string, timedOut: boolean): CuaResult<T> {
 	if (timedOut) {
 		return {
@@ -140,7 +159,6 @@ function toResult<T>(code: number, stdout: string, stderr: string, timedOut: boo
 
 	if (parsedOk && parsed && typeof parsed === "object") {
 		const obj = parsed as Record<string, unknown>;
-		// Documented stable failure shape: {"ok":false,"error":{"code","message","retryable"}}
 		if (obj.ok === false && obj.error && typeof obj.error === "object") {
 			const err = obj.error as Record<string, unknown>;
 			return {
@@ -151,7 +169,16 @@ function toResult<T>(code: number, stdout: string, stderr: string, timedOut: boo
 				raw: stdout,
 			};
 		}
-		if (code === 0 || obj.ok === true) return { ok: true, data: obj as T, json: obj, raw: stdout };
+		if (code !== 0 && typeof obj.code === "string") {
+			const message =
+				typeof obj.message === "string"
+					? obj.message
+					: typeof obj.suggestion === "string"
+						? `${obj.code} — ${obj.suggestion}`
+						: obj.code;
+			return { ok: false, code: obj.code, message, retryable: false, raw: stdout };
+		}
+		if (code === 0) return { ok: true, data: obj as T, json: obj, raw: stdout };
 		return {
 			ok: false,
 			code: "driver_exit",
@@ -161,12 +188,9 @@ function toResult<T>(code: number, stdout: string, stderr: string, timedOut: boo
 		};
 	}
 
-	// Non-JSON: prefer stdout's classified line, else stderr.
-	const textErr = classifyText(stdout || stderr || `cua-driver exited with code ${code}`);
-	if (code === 0 && !stdout.trim()) {
-		return { ok: true, data: {} as T, raw: "" };
-	}
-	return textErr;
+	// Plain text: exit status decides. Success here is normal, not an error.
+	if (code === 0) return { ok: true, data: stdout as unknown as T, raw: stdout };
+	return classifyText(stdout || stderr || `cua-driver exited with code ${code}`, code);
 }
 
 /** Run one cua-driver invocation. Never throws for driver-level failures. */

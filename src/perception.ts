@@ -214,6 +214,29 @@ function outputOfSafe(result: CuaResult): string {
 	return result.raw ?? (result.ok ? "" : result.message);
 }
 
+/**
+ * Interpret `cua-driver extension status cua-perception`.
+ *
+ * The real output is NOT `Status: installed`. Verified on 0.30.4 with 0.2.1 installed:
+ *
+ *   Cua Perception (cua-perception)
+ *   Optional signed perception worker and target-specific model bundle.
+ *   Protocol: 1
+ *   Status: healthy; integrity and publisher verification checks passed
+ *   Active version: 0.2.1
+ *
+ * Matching only `Status: installed` reports a working install as "unknown".
+ */
+export function classifyPerception(text: string): { state: "installed" | "not_installed" | "unknown"; version?: string; detail?: string } {
+	const t = text ?? "";
+	if (/not\s+installed/i.test(t)) return { state: "not_installed" };
+	const version = /active\s+version:\s*([\w.\-]+)/i.exec(t)?.[1];
+	const status = /status:\s*([\w-]+)/i.exec(t)?.[1]?.toLowerCase();
+	if (status === "healthy" || status === "installed" || version) return { state: "installed", version, detail: status };
+	if (status) return { state: "unknown", version, detail: status };
+	return { state: "unknown" };
+}
+
 export async function removePerception(binary: string): Promise<CuaResult<string>> {
 	const result = await runCuaDriver(binary, ["extension", "remove", "cua-perception"], { timeoutMs: 120_000 });
 	if (!result.ok) return result;
