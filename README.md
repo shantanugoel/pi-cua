@@ -42,16 +42,43 @@ cua-driver doctor
 
 ## Enable
 
-Three ways, all persisted except the env var:
+Four ways:
 
 ```bash
 pi -e ./extensions/cua-driver.ts        # one run
 PI_CUA=1 pi                             # one run
 # or in a session:  /cua on             # persists to ~/.pi/agent/pi-cua.json
 # or by hand:       {"driver":{"enabled":true}} in ~/.pi/agent/pi-cua.json
+# or just ask the model: "drive Finder"  # it calls cua_enable (this session only)
 ```
 
 `/cua off` reverses it. `/cua status` shows what is active.
+
+## Context cost when disabled
+
+Off is the default, and off really is off. `cua_status`, `cua_observe`, `cua_act`,
+`cua_verify` and `cua_describe` are registered but **inactive**, and pi builds both the
+tool-snippet list and the rules list from the *selected* tools only
+(`dist/core/system-prompt.js`), so none of their descriptions reach the model. The `/cua`
+command is not model-visible at all. A disabled `session_start` reads one JSON file and
+clears a status line — no subprocess, no driver probe, no MCP child.
+
+Two things are always resident, by design:
+
+- **`cua_enable`** (~1 small tool definition). This is the loader pattern pi documents in
+  `docs/extensions.md`: optional tools stay inactive and a loader tool activates them.
+  Without it a model could not self-enable at all — an inactive tool is absent from the
+  tool list, so calling it throws `Unknown tool name`, extension commands are not
+  model-invocable, and `ctx.reload()` exists only on the command context.
+- **the `cua` skill's frontmatter** (~100 tokens in `<available_skills>`). The 7.5 KB body
+  loads only when the model reads it. To drop even the frontmatter, install with
+  resource filtering: `{"source":"...","skills":[]}`.
+
+`cua_enable` is session-scoped unless called with `persist:true`. A new session clears it;
+`/cua off` clears it. Note that pi promotes every extension tool on `/reload`
+(`includeAllExtensionTools: true`), so `session_start` re-asserts the correct set in both
+directions — otherwise a `/reload` would silently leak the disabled tools back into
+context.
 
 ## Tools
 

@@ -1,13 +1,19 @@
 ---
 name: cua
 description: Drive a native GUI app (macOS) through Pi's cua_* tools — observe a window's accessibility tree, act once on an exact target, then verify. Use when the user asks you to operate, automate, or perform a GUI task in a real application, or when the outcome lives in an app's window state rather than a file or API.
-metadata:
-  requires:
-    bins:
-      - cua-driver
 ---
 
 # Cua computer-use in Pi
+
+## Enabling
+
+The five `cua_*` tools are **inactive by default** and absent from your tool list; only
+`cua_enable` is always present. If `cua_observe` is not available, call `cua_enable`
+first — it activates the rest for this session and touches nothing else. It does not
+persist unless you pass `persist:true`, and it performs no desktop access itself.
+`cua_enable` returning `driver_missing` means Cua Driver is not installed: tell the user
+the install command rather than retrying.
+
 
 Operate one exact target, observe its state, act once, verify the user's
 postcondition. Stop after proof.

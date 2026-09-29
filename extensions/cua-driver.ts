@@ -46,6 +46,16 @@ import { PERCEPTION_NOTICE, classifyPerception, findRelease, installPerception, 
 
 const TOOL_NAMES = ["cua_status", "cua_observe", "cua_act", "cua_verify", "cua_describe"] as const;
 
+/**
+ * The one always-active tool. pi documents exactly this pattern
+ * (docs/extensions.md: "Register every tool first, keep optional tools inactive, and
+ * use pi.setActiveTools() from a loader tool"). Without it a model cannot self-enable:
+ * an inactive tool is absent from the tool list entirely, so calling it throws
+ * "Unknown tool name"; extension commands are not model-invocable; and ctx.reload()
+ * lives on the command context, not the tool context.
+ */
+const LOADER_TOOL = "cua_enable";
+
 const MAX_MODEL_BYTES = 24_000;
 
 /** Pi requires tool content as content blocks, not a bare string. */
@@ -166,6 +176,12 @@ export default function (pi: ExtensionAPI) {
 	const consentedApps = new Set<string>();
 	let sessionLabel = `${config.driver.sessionLabelPrefix}-unknown`;
 	let toolsCache: { at: number; data: Array<{ name: string; summary: string }> } | null = null;
+	/** Set by cua_enable without persisting, so a model can opt in for one session. */
+	let sessionEnabled = false;
+	/** Effective enablement: persisted config OR this session's cua_enable. */
+	function enabled(): boolean {
+		return config.driver.enabled || sessionEnabled;
+	}
 	/**
 	 * Capture state is per-connection, so capture-bound parse_visual_regions and
 	 * capture-bound pixel clicks need one long-lived MCP child. Started lazily, never in
@@ -201,20 +217,79 @@ export default function (pi: ExtensionAPI) {
 
 	function setActive(active: boolean): void {
 		const current = pi.getActiveTools();
+		// The loader stays resident in both directions: it is the entry point a model
+		// uses to turn the rest on, so removing it would strand the capability.
 		if (active) {
-			const merged = [...new Set([...current, ...TOOL_NAMES])];
-			pi.setActiveTools(merged);
+			pi.setActiveTools([...new Set([...current, LOADER_TOOL, ...TOOL_NAMES])]);
 		} else {
-			pi.setActiveTools(current.filter((name) => !TOOL_NAMES.includes(name as (typeof TOOL_NAMES)[number])));
+			pi.setActiveTools(
+				[...new Set([...current, LOADER_TOOL])].filter(
+					(name) => !TOOL_NAMES.includes(name as (typeof TOOL_NAMES)[number]),
+				),
+			);
 		}
 	}
 
 	function statusLine(): string {
 		const bin = resolveBinary(config.driver.binary);
-		return `cua ${config.driver.enabled ? "on" : "off"} · driver ${bin.path ? "found" : "MISSING"} · s1 ${config.s1.enabled ? "on" : "off"}`;
+		return `cua ${enabled() ? "on" : "off"} · driver ${bin.path ? "found" : "MISSING"} · s1 ${config.s1.enabled ? "on" : "off"}`;
 	}
 
 	// ---------------------------------------------------------------- tools
+
+	const LoaderParams = Type.Object({
+		persist: Type.Optional(
+			Type.Boolean({
+				description: "Also write driver.enabled=true to ~/.pi/agent/pi-cua.json so it survives restart. Default false: this session only.",
+			}),
+		),
+	});
+
+	// ------------------------------------------------------------------ loader
+
+	pi.registerTool({
+		name: LOADER_TOOL,
+		label: "Enable Cua",
+		description:
+			"Activate the Cua computer-use tools (cua_status, cua_observe, cua_act, cua_verify, cua_describe) for this session. Use when a task needs to drive a native GUI app. Performs no desktop access and no GUI action itself.",
+		promptSnippet: "Call first if the cua_observe/cua_act tools are not available.",
+		promptGuidelines: [
+			"To drive a native GUI app, call cua_enable, then cua_status, then cua_observe. Never infer window state from memory.",
+		],
+		parameters: LoaderParams,
+		async execute(_id, params: Static<typeof LoaderParams>, _signal, _u, ctx) {
+			const bin = resolveBinary(config.driver.binary);
+			if (!bin.path) {
+				return {
+					content: tc(
+						"Cua Driver is not installed, so there is nothing to enable. Ask the user to install it:\n" +
+							'  /bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"\n' +
+							"Then start the daemon: open -n -g -a CuaDriver --args serve",
+					),
+					details: { enabled: false, reason: "driver_missing" },
+				};
+			}
+			sessionEnabled = true;
+			if (params.persist) {
+				config.driver.enabled = true;
+				saveConfig(config);
+			}
+			setActive(true);
+			ctx.ui.setStatus("cua", statusLine());
+			const perms = await permissionsStatus(bin.path);
+			const lines = [
+				`Cua enabled ${params.persist ? "(persisted)" : "for this session only"}.`,
+				`tools: ${TOOL_NAMES.join(", ")}`,
+				`permissions: ${perms.ok ? JSON.stringify(perms.json).slice(0, 200) : "unknown: " + perms.message}`,
+			];
+			lines.push("Next: cua_status, then cua_observe. A GUI action still needs per-action consent where policy requires it.");
+			if (!params.persist) lines.push("Stays on until `/cua off` or a new session. Use persist:true to survive restarts and /reload.");
+			return {
+				content: tc(lines.join("\n")),
+				details: { enabled: true, persisted: params.persist === true, permissions: perms.ok ? perms.json : perms.code },
+			};
+		},
+	});
 
 	pi.registerTool({
 		name: "cua_status",
@@ -232,7 +307,7 @@ export default function (pi: ExtensionAPI) {
 			const out: Record<string, unknown> = {
 				binary: bin,
 				configPath: CONFIG_PATH,
-				driverEnabled: config.driver.enabled,
+				driverEnabled: enabled(),
 				s1Enabled: config.s1.enabled,
 				permissionMode: config.driver.permissionMode,
 				sessionLabel,
@@ -683,8 +758,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (sub === "on" || sub === "enable") {
 				config.driver.enabled = true;
+				sessionEnabled = false;
 				saveConfig(config);
 				setActive(true);
+				ctx.ui.setStatus("cua", statusLine());
 				ctx.ui.notify("pi-cua driver tools enabled and saved", "info");
 				// One-time discoverability nudge: regions is the only route into non-AX
 				// surfaces, and it is off by default upstream.
@@ -702,8 +779,10 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (sub === "off" || sub === "disable") {
 				config.driver.enabled = false;
+				sessionEnabled = false;
 				saveConfig(config);
 				setActive(false);
+				ctx.ui.setStatus("cua", undefined);
 				ctx.ui.notify("pi-cua driver tools disabled and saved", "info");
 				return;
 			}
@@ -789,7 +868,7 @@ export default function (pi: ExtensionAPI) {
 
 			const bin = resolveBinary(config.driver.binary);
 			const lines = [
-				`driver:    ${config.driver.enabled ? "enabled" : "disabled (default)"} · active=${pi.getActiveTools().includes("cua_status")}`,
+				`driver:    ${enabled() ? "enabled" : "disabled (default)"} · active=${pi.getActiveTools().includes("cua_status")}`,
 				`binary:    ${bin.path ?? `not found (${bin.source})`}`,
 				`mode:      ${config.driver.permissionMode}`,
 				`s1:        ${config.s1.enabled ? `enabled (${config.s1.checkpoint}, ${config.s1.modality})` : "disabled (default)"}`,
@@ -813,11 +892,17 @@ export default function (pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------- lifecycle
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		// A genuinely new session must not inherit a previous session's cua_enable;
+		// reload/resume/fork are continuations of the same working context and keep it.
+		if ((event as { reason?: string }).reason === "startup") sessionEnabled = false;
 		config = loadConfig();
 		sessionLabel = `${config.driver.sessionLabelPrefix}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-		if (config.driver.enabled) setActive(true);
-		ctx.ui.setStatus("cua", config.driver.enabled ? statusLine() : undefined);
+		// Always assert, in both directions. On reload pi passes
+		// includeAllExtensionTools:true, which would otherwise promote every cua_* tool
+		// into the active set regardless of config and leak them into context.
+		setActive(enabled());
+		ctx.ui.setStatus("cua", enabled() ? statusLine() : undefined);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -834,9 +919,11 @@ export default function (pi: ExtensionAPI) {
 	// (for example a third-party MCP adapter exposing the same tools).
 	pi.on("tool_call", async (event) => {
 		if (!event.toolName.startsWith("cua_")) return undefined;
+		// The loader is the way IN, so it must never be gated.
+		if (event.toolName === LOADER_TOOL) return undefined;
 		// Disabled by default: refuse until the user opts in.
-		if (!config.driver.enabled) {
-			return { block: true, reason: "pi-cua is disabled. Run /cua on, or set driver.enabled in ~/.pi/agent/pi-cua.json." };
+		if (!enabled()) {
+			return { block: true, reason: "pi-cua is disabled. Call cua_enable to turn the tools on for this session, or ask the user to run /cua on." };
 		}
 		return undefined;
 	});
